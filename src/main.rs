@@ -14,12 +14,15 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeRequestFilterBlocks, SubscribeRequestFilterBlocksMeta,
     SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
     SubscribeRequestPing, SubscribeUpdate,
+    SubscribeDeshredRequest, SubscribeRequestFilterDeshredTransactions,
+    SubscribeReplayInfoRequest,
     geyser_client::GeyserClient, subscribe_update::UpdateOneof,
+    subscribe_update_deshred,
 };
 use yellowstone_grpc_proto::tonic;
 use yellowstone_grpc_proto::tonic::transport::{Channel, Endpoint};
 
-const DEFAULT_ENDPOINT: &str = "https://solana-mainnet-grpc.gateway.tatum.dev";
+const DEFAULT_ENDPOINT: &str = "https://solana-mainnet-grpc.gateway.tatum.io";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const MAX_DECODE_SIZE: usize = 128 * 1024 * 1024;
@@ -344,6 +347,18 @@ async fn test_is_blockhash_valid() -> Result<String> {
         bail!("blockhash {blockhash} reported as invalid (slot={})", resp.slot);
     }
     Ok(format!("blockhash={blockhash} valid=true slot={}", resp.slot))
+}
+
+async fn test_subscribe_replay_info() -> Result<String> {
+    let mut client = connect!();
+    let resp = client
+        .subscribe_replay_info(SubscribeReplayInfoRequest {})
+        .await?
+        .into_inner();
+    match resp.first_available {
+        Some(slot) => Ok(format!("first_available_slot={slot}")),
+        None => Ok("first_available_slot=none (replay not available)".to_string()),
+    }
 }
 
 // --- Streaming Subscription Tests ---
@@ -713,6 +728,237 @@ async fn test_unsubscribe() -> Result<String> {
     ))
 }
 
+/// SubscribeDeshred: the second streaming subscribe method.
+/// Subscribes to deshredded transactions (low-latency, pre-block).
+async fn test_subscribe_deshred() -> Result<String> {
+    let mut client = connect!();
+    let (tx, rx) = mpsc::channel::<SubscribeDeshredRequest>(16);
+    tx.send(SubscribeDeshredRequest {
+        deshred_transactions: HashMap::from([(
+            "deshred_sub".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: Some(false),
+                account_include: vec![SYSTEM_PROGRAM.to_string()],
+                ..Default::default()
+            },
+        )]),
+        ping: None,
+    }).await.map_err(|_| anyhow::anyhow!("send failed"))?;
+
+    let mut stream = match client
+        .subscribe_deshred(ReceiverStream::new(rx))
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::Unimplemented => {
+            return Ok(format!("SKIPPED — server does not support SubscribeDeshred: {}", status.message()));
+        }
+        Err(e) => return Err(e.into()),
+        Ok(resp) => resp.into_inner(),
+    };
+
+    let mut count = 0u32;
+    let mut ping_count = 0u32;
+    let detail = tokio::time::timeout(stream_timeout(), async {
+        while let Some(msg) = stream.next().await {
+            let msg = msg?;
+            match msg.update_oneof {
+                Some(subscribe_update_deshred::UpdateOneof::DeshredTransaction(dt)) => {
+                    count += 1;
+                    if count == 1 {
+                        let sig = dt.transaction.as_ref()
+                            .map(|t| bs58_encode(&t.signature))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let sig_short = &sig[..8.min(sig.len())];
+                        return Ok::<_, anyhow::Error>(format!(
+                            "received deshred tx at slot={}, sig: {sig_short}...",
+                            dt.slot
+                        ));
+                    }
+                }
+                Some(subscribe_update_deshred::UpdateOneof::Ping(_)) => {
+                    ping_count += 1;
+                    let _ = tx.send(SubscribeDeshredRequest {
+                        deshred_transactions: HashMap::new(),
+                        ping: Some(SubscribeRequestPing { id: ping_count as i32 }),
+                    }).await;
+                }
+                _ => {}
+            }
+        }
+        bail!("stream ended without deshred transaction")
+    })
+    .await
+    .context("timed out waiting for deshred transactions")??;
+
+    Ok(detail)
+}
+
+/// Back pressure: subscribe to a high-volume stream but read slowly.
+/// Verifies the proxy handles slow consumers gracefully.
+async fn test_back_pressure() -> Result<String> {
+    let request = SubscribeRequest {
+        transactions: HashMap::from([(
+            "backpressure_sub".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                account_include: vec![SYSTEM_PROGRAM.to_string()],
+                ..Default::default()
+            },
+        )]),
+        commitment: Some(CommitmentLevel::Confirmed as i32),
+        ..Default::default()
+    };
+    let mut sub = GeyserStream::connect(request).await?;
+
+    // Read a few fast to confirm stream works
+    let mut fast_count = 0u32;
+    tokio::time::timeout(stream_timeout(), async {
+        while let Some(update) = sub.next_data().await? {
+            if let UpdateOneof::Transaction(_) = update {
+                fast_count += 1;
+                if fast_count >= 2 { break; }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("timed out during fast-read phase")??;
+
+    // Now read slowly: sleep 3s between each read
+    let mut slow_count = 0u32;
+    let slow_reads = 3u32;
+    let slow_delay = Duration::from_secs(3);
+
+    for _ in 0..slow_reads {
+        tokio::time::sleep(slow_delay).await;
+        let msg = tokio::time::timeout(stream_timeout(), sub.next_data())
+            .await
+            .context("timed out during slow-read phase")?;
+        match msg? {
+            Some(UpdateOneof::Transaction(_)) => { slow_count += 1; }
+            Some(_) => { slow_count += 1; } // any data is fine
+            None => bail!("stream closed during slow reading (back pressure disconnect)"),
+        }
+    }
+
+    // Final fast read to verify stream still works
+    let mut post_count = 0u32;
+    tokio::time::timeout(stream_timeout(), async {
+        while let Some(update) = sub.next_data().await? {
+            if let UpdateOneof::Transaction(_) = update {
+                post_count += 1;
+                if post_count >= 2 { break; }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("timed out after slow-read phase (stream may have died)")??;
+
+    Ok(format!(
+        "fast={fast_count} slow={slow_count}/{slow_reads} ({}s delay each) post={post_count} — stream survived",
+        slow_delay.as_secs()
+    ))
+}
+
+/// Soak test: run all subscriptions for an extended period (default 2 hours).
+/// Monitors for connection drops, message gaps, parse errors, and throughput.
+/// Enable with SOAK=1 env var. Duration via SOAK_DURATION_SECS (default 7200).
+async fn test_soak(duration_secs: u64) -> Result<String> {
+    let duration = Duration::from_secs(duration_secs);
+    let report_interval = Duration::from_secs(60);
+
+    println!("         soak test starting for {}h{}m...",
+        duration_secs / 3600, (duration_secs % 3600) / 60);
+
+    // Subscribe to slots + transactions + blocks_meta simultaneously
+    let request = SubscribeRequest {
+        slots: HashMap::from([(
+            "soak_slots".to_string(),
+            SubscribeRequestFilterSlots {
+                filter_by_commitment: Some(true),
+                ..Default::default()
+            },
+        )]),
+        transactions: HashMap::from([(
+            "soak_txs".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                account_include: vec![SYSTEM_PROGRAM.to_string()],
+                ..Default::default()
+            },
+        )]),
+        blocks_meta: HashMap::from([(
+            "soak_bmeta".to_string(),
+            SubscribeRequestFilterBlocksMeta {},
+        )]),
+        commitment: Some(CommitmentLevel::Confirmed as i32),
+        ..Default::default()
+    };
+
+    let mut sub = GeyserStream::connect(request).await?;
+
+    let mut slot_count = 0u64;
+    let mut tx_count = 0u64;
+    let mut meta_count = 0u64;
+    let errors = 0u64;
+    let mut last_slot: Option<u64> = None;
+    let mut slot_gaps = 0u64;
+    let mut last_report = Instant::now();
+    let start = Instant::now();
+
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            msg = sub.next_data() => {
+                match msg {
+                    Ok(Some(UpdateOneof::Slot(s))) => {
+                        if let Some(prev) = last_slot {
+                            if s.slot > prev + 1 {
+                                slot_gaps += 1;
+                            }
+                        }
+                        last_slot = Some(s.slot);
+                        slot_count += 1;
+                    }
+                    Ok(Some(UpdateOneof::Transaction(_))) => { tx_count += 1; }
+                    Ok(Some(UpdateOneof::BlockMeta(_))) => { meta_count += 1; }
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        bail!("stream closed unexpectedly at {:?} elapsed (errors={errors})", start.elapsed());
+                    }
+                    Err(e) => {
+                        bail!("stream error at {:?} elapsed (errors={errors}): {e:#}", start.elapsed());
+                    }
+                }
+
+                // Periodic report
+                if last_report.elapsed() >= report_interval {
+                    let elapsed = start.elapsed();
+                    let mins = elapsed.as_secs() / 60;
+                    println!(
+                        "         [{mins}m] slots={slot_count} txs={tx_count} metas={meta_count} gaps={slot_gaps} pings={} errors={errors}",
+                        sub.pings_handled
+                    );
+                    last_report = Instant::now();
+                }
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    Ok(format!(
+        "ran for {:.1}m: slots={slot_count} txs={tx_count} metas={meta_count} slot_gaps={slot_gaps} pings={} errors={errors}",
+        elapsed.as_secs_f64() / 60.0,
+        sub.pings_handled
+    ))
+}
+
 // --- Main ---
 
 #[tokio::main]
@@ -739,6 +985,7 @@ async fn main() {
     t.run("GetBlockHeight", test_get_block_height()).await;
     t.run("GetSlot", test_get_slot()).await;
     t.run("IsBlockhashValid", test_is_blockhash_valid()).await;
+    t.run("SubscribeReplayInfo", test_subscribe_replay_info()).await;
 
     println!();
     println!("--- Streaming Subscriptions ---");
@@ -747,13 +994,29 @@ async fn main() {
     t.run("Subscribe Transactions (System)", test_subscribe_transactions()).await;
     t.run("Subscribe Blocks Meta", test_subscribe_blocks_meta()).await;
     t.run("Subscribe Full Block", test_subscribe_full_block()).await;
+    t.run("Subscribe Deshred (txs)", test_subscribe_deshred()).await;
 
     println!();
     println!("--- Advanced Stream Tests ---");
     t.run("Keepalive (ping/pong)", test_keepalive()).await;
     t.run("Re-subscribe (slots -> blocks_meta)", test_resubscribe()).await;
     t.run("Unsubscribe (empty filters)", test_unsubscribe()).await;
+    t.run("Back Pressure (slow reader)", test_back_pressure()).await;
 
     t.summary();
+
+    // Soak test: long-running stability test (enable with SOAK_DURATION_SECS=7200)
+    let soak_secs = env::var("SOAK_DURATION_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if soak_secs > 0 {
+        println!();
+        println!("--- Soak Test ---");
+        t.run("Soak (long-running stability)", test_soak(soak_secs)).await;
+        println!();
+        t.summary();
+    }
+
     process::exit(t.exit_code());
 }
