@@ -10,14 +10,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use yellowstone_grpc_client::ClientTlsConfig;
 use yellowstone_grpc_proto::geyser::{
-    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-    SubscribeRequestFilterBlocks, SubscribeRequestFilterBlocksMeta,
-    SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
-    SubscribeRequestPing, SubscribeUpdate,
-    SubscribeDeshredRequest, SubscribeRequestFilterDeshredTransactions,
-    SubscribeReplayInfoRequest,
-    geyser_client::GeyserClient, subscribe_update::UpdateOneof,
-    subscribe_update_deshred,
+    CommitmentLevel, SubscribeDeshredRequest, SubscribeReplayInfoRequest, SubscribeRequest,
+    SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks, SubscribeRequestFilterBlocksMeta,
+    SubscribeRequestFilterDeshredTransactions, SubscribeRequestFilterSlots,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
+    geyser_client::GeyserClient, subscribe_update::UpdateOneof, subscribe_update_deshred,
 };
 use yellowstone_grpc_proto::tonic;
 use yellowstone_grpc_proto::tonic::transport::{Channel, Endpoint};
@@ -61,8 +58,8 @@ fn keepalive_timeout() -> Duration {
 
 async fn connect_channel() -> Result<Channel> {
     let url = get_endpoint();
-    let endpoint = Endpoint::from_shared(url)?
-        .tls_config(ClientTlsConfig::new().with_native_roots())?;
+    let endpoint =
+        Endpoint::from_shared(url)?.tls_config(ClientTlsConfig::new().with_native_roots())?;
     let channel = endpoint.connect().await?;
     Ok(channel)
 }
@@ -102,12 +99,20 @@ impl GeyserStream {
     async fn connect(request: SubscribeRequest) -> Result<Self> {
         let mut client = connect!();
         let (tx, rx) = mpsc::channel::<SubscribeRequest>(16);
-        tx.send(request).await.map_err(|_| anyhow::anyhow!("send failed"))?;
+        tx.send(request)
+            .await
+            .map_err(|_| anyhow::anyhow!("send failed"))?;
         let stream = client
             .subscribe(ReceiverStream::new(rx))
             .await?
             .into_inner();
-        Ok(Self { tx, stream, ping_counter: 0, pings_handled: 0, pongs_received: 0 })
+        Ok(Self {
+            tx,
+            stream,
+            ping_counter: 0,
+            pings_handled: 0,
+            pongs_received: 0,
+        })
     }
 
     /// Get next data update, automatically replying to server pings.
@@ -138,7 +143,9 @@ impl GeyserStream {
                 Some(UpdateOneof::Ping(_)) => {
                     self.reply_to_ping().await;
                     // Return the ping event so caller can see it
-                    return Ok(Some(UpdateOneof::Ping(yellowstone_grpc_proto::geyser::SubscribeUpdatePing {})));
+                    return Ok(Some(UpdateOneof::Ping(
+                        yellowstone_grpc_proto::geyser::SubscribeUpdatePing {},
+                    )));
                 }
                 Some(update) => return Ok(Some(update)),
                 None => {}
@@ -150,16 +157,23 @@ impl GeyserStream {
     async fn reply_to_ping(&mut self) {
         self.ping_counter += 1;
         self.pings_handled += 1;
-        let _ = self.tx.send(SubscribeRequest {
-            ping: Some(SubscribeRequestPing { id: self.ping_counter }),
-            ..Default::default()
-        }).await;
+        let _ = self
+            .tx
+            .send(SubscribeRequest {
+                ping: Some(SubscribeRequestPing {
+                    id: self.ping_counter,
+                }),
+                ..Default::default()
+            })
+            .await;
     }
 
     /// Send a new SubscribeRequest (for re-subscription or unsubscribe).
     /// This REPLACES all existing filters.
     async fn send(&self, request: SubscribeRequest) -> Result<()> {
-        self.tx.send(request).await
+        self.tx
+            .send(request)
+            .await
             .map_err(|_| anyhow::anyhow!("failed to send subscribe request"))?;
         Ok(())
     }
@@ -216,7 +230,10 @@ struct TestRunner {
 
 impl TestRunner {
     fn new() -> Self {
-        Self { passed: 0, total: 0 }
+        Self {
+            passed: 0,
+            total: 0,
+        }
     }
 
     async fn run(&mut self, name: &str, fut: impl Future<Output = Result<String>>) {
@@ -344,9 +361,15 @@ async fn test_is_blockhash_valid() -> Result<String> {
         .context("is_blockhash_valid call failed")?
         .into_inner();
     if !resp.valid {
-        bail!("blockhash {blockhash} reported as invalid (slot={})", resp.slot);
+        bail!(
+            "blockhash {blockhash} reported as invalid (slot={})",
+            resp.slot
+        );
     }
-    Ok(format!("blockhash={blockhash} valid=true slot={}", resp.slot))
+    Ok(format!(
+        "blockhash={blockhash} valid=true slot={}",
+        resp.slot
+    ))
 }
 
 async fn test_subscribe_replay_info() -> Result<String> {
@@ -384,7 +407,9 @@ async fn test_subscribe_slots() -> Result<String> {
             if let UpdateOneof::Slot(slot) = update {
                 slots.push(slot.slot);
                 count += 1;
-                if count >= 3 { break; }
+                if count >= 3 {
+                    break;
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -392,7 +417,10 @@ async fn test_subscribe_slots() -> Result<String> {
     .await
     .context("timed out waiting for slot updates")??;
 
-    Ok(format!("received {count} slots: {slots:?} (pings handled: {})", sub.pings_handled))
+    Ok(format!(
+        "received {count} slots: {slots:?} (pings handled: {})",
+        sub.pings_handled
+    ))
 }
 
 async fn test_subscribe_accounts() -> Result<String> {
@@ -459,7 +487,9 @@ async fn test_subscribe_transactions() -> Result<String> {
                     .unwrap_or_else(|| "unknown".to_string());
                 sigs.push(sig);
                 count += 1;
-                if count >= 3 { break; }
+                if count >= 3 {
+                    break;
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -467,7 +497,10 @@ async fn test_subscribe_transactions() -> Result<String> {
     .await
     .context("timed out waiting for transaction updates")??;
 
-    let sigs_display: Vec<String> = sigs.iter().map(|s| s[..8.min(s.len())].to_string()).collect();
+    let sigs_display: Vec<String> = sigs
+        .iter()
+        .map(|s| s[..8.min(s.len())].to_string())
+        .collect();
     Ok(format!("received {count} txs, sigs: {sigs_display:?}"))
 }
 
@@ -492,7 +525,9 @@ async fn test_subscribe_blocks_meta() -> Result<String> {
                     meta.slot, meta.blockhash, meta.executed_transaction_count
                 ));
                 count += 1;
-                if count >= 2 { break; }
+                if count >= 2 {
+                    break;
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -500,7 +535,10 @@ async fn test_subscribe_blocks_meta() -> Result<String> {
     .await
     .context("timed out waiting for blocks_meta updates")??;
 
-    Ok(format!("received {count} blocks_meta\n         {}", details.join("\n         ")))
+    Ok(format!(
+        "received {count} blocks_meta\n         {}",
+        details.join("\n         ")
+    ))
 }
 
 async fn test_subscribe_full_block() -> Result<String> {
@@ -563,8 +601,12 @@ async fn test_keepalive() -> Result<String> {
         let deadline = Instant::now() + duration;
         while Instant::now() < deadline {
             match sub.next_raw().await? {
-                Some(UpdateOneof::Slot(_)) => { slot_count += 1; }
-                Some(UpdateOneof::Pong(_)) => { sub.pongs_received += 1; }
+                Some(UpdateOneof::Slot(_)) => {
+                    slot_count += 1;
+                }
+                Some(UpdateOneof::Pong(_)) => {
+                    sub.pongs_received += 1;
+                }
                 Some(UpdateOneof::Ping(_)) => { /* already handled in next_raw */ }
                 None => bail!("stream closed unexpectedly during keepalive"),
                 _ => {}
@@ -576,7 +618,9 @@ async fn test_keepalive() -> Result<String> {
     .context("keepalive test timed out")??;
 
     if sub.pings_handled == 0 {
-        bail!("ran for {duration:.0?} but received 0 server pings (expected at least 1 every ~15s)");
+        bail!(
+            "ran for {duration:.0?} but received 0 server pings (expected at least 1 every ~15s)"
+        );
     }
 
     Ok(format!(
@@ -608,7 +652,9 @@ async fn test_resubscribe() -> Result<String> {
         while let Some(update) = sub.next_data().await? {
             if let UpdateOneof::Slot(_) = update {
                 slot_count += 1;
-                if slot_count >= 3 { break; }
+                if slot_count >= 3 {
+                    break;
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -635,7 +681,9 @@ async fn test_resubscribe() -> Result<String> {
             match update {
                 UpdateOneof::BlockMeta(_) => {
                     meta_count += 1;
-                    if meta_count >= 2 { break; }
+                    if meta_count >= 2 {
+                        break;
+                    }
                 }
                 UpdateOneof::Slot(_) => {
                     // Slots arriving after re-sub are "stale" (may get a few in-flight)
@@ -743,14 +791,16 @@ async fn test_subscribe_deshred() -> Result<String> {
             },
         )]),
         ping: None,
-    }).await.map_err(|_| anyhow::anyhow!("send failed"))?;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("send failed"))?;
 
-    let mut stream = match client
-        .subscribe_deshred(ReceiverStream::new(rx))
-        .await
-    {
+    let mut stream = match client.subscribe_deshred(ReceiverStream::new(rx)).await {
         Err(status) if status.code() == tonic::Code::Unimplemented => {
-            return Ok(format!("SKIPPED — server does not support SubscribeDeshred: {}", status.message()));
+            return Ok(format!(
+                "SKIPPED — server does not support SubscribeDeshred: {}",
+                status.message()
+            ));
         }
         Err(e) => return Err(e.into()),
         Ok(resp) => resp.into_inner(),
@@ -765,7 +815,9 @@ async fn test_subscribe_deshred() -> Result<String> {
                 Some(subscribe_update_deshred::UpdateOneof::DeshredTransaction(dt)) => {
                     count += 1;
                     if count == 1 {
-                        let sig = dt.transaction.as_ref()
+                        let sig = dt
+                            .transaction
+                            .as_ref()
                             .map(|t| bs58_encode(&t.signature))
                             .unwrap_or_else(|| "unknown".to_string());
                         let sig_short = &sig[..8.min(sig.len())];
@@ -777,10 +829,14 @@ async fn test_subscribe_deshred() -> Result<String> {
                 }
                 Some(subscribe_update_deshred::UpdateOneof::Ping(_)) => {
                     ping_count += 1;
-                    let _ = tx.send(SubscribeDeshredRequest {
-                        deshred_transactions: HashMap::new(),
-                        ping: Some(SubscribeRequestPing { id: ping_count as i32 }),
-                    }).await;
+                    let _ = tx
+                        .send(SubscribeDeshredRequest {
+                            deshred_transactions: HashMap::new(),
+                            ping: Some(SubscribeRequestPing {
+                                id: ping_count as i32,
+                            }),
+                        })
+                        .await;
                 }
                 _ => {}
             }
@@ -817,7 +873,9 @@ async fn test_back_pressure() -> Result<String> {
         while let Some(update) = sub.next_data().await? {
             if let UpdateOneof::Transaction(_) = update {
                 fast_count += 1;
-                if fast_count >= 2 { break; }
+                if fast_count >= 2 {
+                    break;
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -836,8 +894,12 @@ async fn test_back_pressure() -> Result<String> {
             .await
             .context("timed out during slow-read phase")?;
         match msg? {
-            Some(UpdateOneof::Transaction(_)) => { slow_count += 1; }
-            Some(_) => { slow_count += 1; } // any data is fine
+            Some(UpdateOneof::Transaction(_)) => {
+                slow_count += 1;
+            }
+            Some(_) => {
+                slow_count += 1;
+            } // any data is fine
             None => bail!("stream closed during slow reading (back pressure disconnect)"),
         }
     }
@@ -848,7 +910,9 @@ async fn test_back_pressure() -> Result<String> {
         while let Some(update) = sub.next_data().await? {
             if let UpdateOneof::Transaction(_) = update {
                 post_count += 1;
-                if post_count >= 2 { break; }
+                if post_count >= 2 {
+                    break;
+                }
             }
         }
         Ok::<_, anyhow::Error>(())
@@ -869,8 +933,11 @@ async fn test_soak(duration_secs: u64) -> Result<String> {
     let duration = Duration::from_secs(duration_secs);
     let report_interval = Duration::from_secs(60);
 
-    println!("         soak test starting for {}h{}m...",
-        duration_secs / 3600, (duration_secs % 3600) / 60);
+    println!(
+        "         soak test starting for {}h{}m...",
+        duration_secs / 3600,
+        (duration_secs % 3600) / 60
+    );
 
     // Subscribe to slots + transactions + blocks_meta simultaneously
     let request = SubscribeRequest {
@@ -918,10 +985,10 @@ async fn test_soak(duration_secs: u64) -> Result<String> {
             msg = sub.next_data() => {
                 match msg {
                     Ok(Some(UpdateOneof::Slot(s))) => {
-                        if let Some(prev) = last_slot {
-                            if s.slot > prev + 1 {
-                                slot_gaps += 1;
-                            }
+                        if let Some(prev) = last_slot
+                            && s.slot > prev + 1
+                        {
+                            slot_gaps += 1;
                         }
                         last_slot = Some(s.slot);
                         slot_count += 1;
@@ -972,8 +1039,12 @@ async fn main() {
     println!("=== Yellowstone gRPC Proxy Test ===");
     println!("Endpoint: {endpoint}");
     println!("Auth header: {auth_header}");
-    println!("Timeouts: stream={}s block={}s keepalive={}s",
-        stream_timeout().as_secs(), block_timeout().as_secs(), keepalive_timeout().as_secs());
+    println!(
+        "Timeouts: stream={}s block={}s keepalive={}s",
+        stream_timeout().as_secs(),
+        block_timeout().as_secs(),
+        keepalive_timeout().as_secs()
+    );
     println!();
 
     let mut t = TestRunner::new();
@@ -981,27 +1052,40 @@ async fn main() {
     println!("--- Unary RPCs ---");
     t.run("GetVersion", test_get_version()).await;
     t.run("Ping", test_ping()).await;
-    t.run("GetLatestBlockhash", test_get_latest_blockhash()).await;
+    t.run("GetLatestBlockhash", test_get_latest_blockhash())
+        .await;
     t.run("GetBlockHeight", test_get_block_height()).await;
     t.run("GetSlot", test_get_slot()).await;
     t.run("IsBlockhashValid", test_is_blockhash_valid()).await;
-    t.run("SubscribeReplayInfo", test_subscribe_replay_info()).await;
+    t.run("SubscribeReplayInfo", test_subscribe_replay_info())
+        .await;
 
     println!();
     println!("--- Streaming Subscriptions ---");
     t.run("Subscribe Slots", test_subscribe_slots()).await;
-    t.run("Subscribe Accounts (USDC)", test_subscribe_accounts()).await;
-    t.run("Subscribe Transactions (System)", test_subscribe_transactions()).await;
-    t.run("Subscribe Blocks Meta", test_subscribe_blocks_meta()).await;
-    t.run("Subscribe Full Block", test_subscribe_full_block()).await;
-    t.run("Subscribe Deshred (txs)", test_subscribe_deshred()).await;
+    t.run("Subscribe Accounts (USDC)", test_subscribe_accounts())
+        .await;
+    t.run(
+        "Subscribe Transactions (System)",
+        test_subscribe_transactions(),
+    )
+    .await;
+    t.run("Subscribe Blocks Meta", test_subscribe_blocks_meta())
+        .await;
+    t.run("Subscribe Full Block", test_subscribe_full_block())
+        .await;
+    t.run("Subscribe Deshred (txs)", test_subscribe_deshred())
+        .await;
 
     println!();
     println!("--- Advanced Stream Tests ---");
     t.run("Keepalive (ping/pong)", test_keepalive()).await;
-    t.run("Re-subscribe (slots -> blocks_meta)", test_resubscribe()).await;
-    t.run("Unsubscribe (empty filters)", test_unsubscribe()).await;
-    t.run("Back Pressure (slow reader)", test_back_pressure()).await;
+    t.run("Re-subscribe (slots -> blocks_meta)", test_resubscribe())
+        .await;
+    t.run("Unsubscribe (empty filters)", test_unsubscribe())
+        .await;
+    t.run("Back Pressure (slow reader)", test_back_pressure())
+        .await;
 
     t.summary();
 
@@ -1013,7 +1097,8 @@ async fn main() {
     if soak_secs > 0 {
         println!();
         println!("--- Soak Test ---");
-        t.run("Soak (long-running stability)", test_soak(soak_secs)).await;
+        t.run("Soak (long-running stability)", test_soak(soak_secs))
+            .await;
         println!();
         t.summary();
     }
