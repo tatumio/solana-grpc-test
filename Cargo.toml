@@ -1,0 +1,14 @@
+[package]
+name = "grpc-test-tonic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+yellowstone-grpc-client = "12.1.0"
+yellowstone-grpc-proto = "12.1.0"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+anyhow = "1"
+prost = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-stream = "0.1"
