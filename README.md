@@ -1,6 +1,16 @@
-# grpc-test-tonic
+# solana-grpc-test
 
-Test client for validating Solana Yellowstone gRPC (Geyser) endpoints. Runs a suite of unary RPCs, streaming subscriptions, and edge-case tests, then reports pass/fail.
+Test suite for validating Solana Yellowstone gRPC (Geyser) endpoints. Tests all RPCs, streaming subscriptions, and edge cases, then reports pass/fail.
+
+## Install
+
+```bash
+cargo install --path .
+```
+
+This builds the binary and puts it in `~/.cargo/bin/solana-grpc-test`. Make sure `~/.cargo/bin` is in your `PATH` (it is by default with rustup).
+
+If you just want to run from source without installing, use `cargo run --` instead of `solana-grpc-test` in any command below.
 
 ## Prerequisites
 
@@ -10,44 +20,88 @@ Test client for validating Solana Yellowstone gRPC (Geyser) endpoints. Runs a su
 ## Usage
 
 ```bash
-GRPC_ENDPOINT='https://solana-mainnet-grpc.gateway.tatum.io' \
-  API_KEY='your-api-key' \
-  cargo run
+# Run all tests
+solana-grpc-test -k <api-key>
+
+# Custom endpoint
+solana-grpc-test -e https://your-endpoint.com -k <api-key>
+
+# Custom endpoint with different auth header (e.g. x-token instead of x-api-key)
+solana-grpc-test -e https://your-endpoint.com -H x-token -k <api-key>
+
+# Run only unary RPCs
+solana-grpc-test -k <api-key> unary
+
+# Run only streaming tests
+solana-grpc-test -k <api-key> stream
+
+# Run specific tests
+solana-grpc-test -k <api-key> run version ping slots
+
+# 2-hour soak test
+solana-grpc-test -k <api-key> soak 7200
+
+# List all available tests
+solana-grpc-test list
 ```
 
-## Environment variables
+With `cargo run`:
+```bash
+cargo run -- -k <api-key>
+cargo run -- -k <api-key> unary
+cargo run -- -k <api-key> run version ping
+cargo run -- -k <api-key> soak 300
+```
 
-| Variable | Required | Default | Description |
+All options can also be set via environment variables:
+```bash
+API_KEY=<key> GRPC_ENDPOINT=https://your-endpoint.com cargo run
+```
+
+## Options
+
+| Flag | Env var | Default | Description |
 |---|---|---|---|
-| `API_KEY` | yes | — | Auth token for the gRPC endpoint |
-| `GRPC_ENDPOINT` | no | `https://solana-mainnet-grpc.gateway.tatum.io` | gRPC endpoint URL |
-| `AUTH_HEADER` | no | `x-api-key` | HTTP header name for the token (e.g. `x-token` for Shyft) |
-| `STREAM_TIMEOUT_SECS` | no | `30` | Timeout for streaming subscription tests |
-| `BLOCK_TIMEOUT_SECS` | no | `120` | Timeout for full block reception |
-| `KEEPALIVE_TIMEOUT_SECS` | no | `40` | How long the keepalive test runs |
-| `SOAK_DURATION_SECS` | no | `0` (off) | Long-running stability test duration. Set to `7200` for 2 hours |
+| `-k, --api-key` | `API_KEY` | (required) | Auth token |
+| `-e, --endpoint` | `GRPC_ENDPOINT` | `https://solana-mainnet-grpc.gateway.tatum.io` | gRPC endpoint URL |
+| `-H, --auth-header` | `AUTH_HEADER` | `x-api-key` | Header name for the token (e.g. `x-token` for Shyft) |
+| `--stream-timeout` | `STREAM_TIMEOUT_SECS` | `30` | Timeout for streaming tests (seconds) |
+| `--block-timeout` | `BLOCK_TIMEOUT_SECS` | `120` | Timeout for full block reception (seconds) |
+| `--keepalive-timeout` | `KEEPALIVE_TIMEOUT_SECS` | `40` | Keepalive test duration (seconds) |
+
+## Subcommands
+
+| Command | Description |
+|---|---|
+| _(none)_ / `all` | Run all 17 tests |
+| `unary` | Run unary RPC tests only |
+| `stream` | Run streaming subscription tests only |
+| `advanced` | Run advanced stream tests only |
+| `run <test>...` | Run specific test(s) by name |
+| `soak [seconds]` | Long-running soak test (default: 7200s = 2 hours) |
+| `list` | List all available test names |
 
 ## Tests
 
 Each test maps 1:1 to a function in `src/main.rs`.
 
-| # | Test | What it does |
+| # | Name | What it does |
 |---|---|---|
-| 1 | **GetVersion** | Calls `GetVersion` RPC, logs the server version string |
-| 2 | **Ping** | Calls `Ping` RPC with count=1, verifies the pong response matches |
-| 3 | **GetLatestBlockhash** | Calls `GetLatestBlockhash` at all 3 commitment levels (processed, confirmed, finalized), logs slot + blockhash |
-| 4 | **GetBlockHeight** | Calls `GetBlockHeight` at all 3 commitment levels |
-| 5 | **GetSlot** | Calls `GetSlot` at all 3 commitment levels |
-| 6 | **IsBlockhashValid** | Fetches a finalized blockhash, then validates it — checks the server says it's valid |
-| 7 | **SubscribeReplayInfo** | Calls `SubscribeReplayInfo` RPC, logs the first available slot for replay |
-| 8 | **Subscribe Slots** | Opens a `Subscribe` stream with a slots filter (confirmed), waits for 3 slot updates |
-| 9 | **Subscribe Accounts** | Subscribes to the USDC mint account (`EPjFWdd5...`), waits for 1 account update, logs data length |
-| 10 | **Subscribe Transactions** | Subscribes to non-vote, non-failed transactions involving the System Program, waits for 3 |
-| 11 | **Subscribe Blocks Meta** | Subscribes to block metadata (confirmed), waits for 2, logs slot + blockhash + tx count |
-| 12 | **Subscribe Full Block** | Subscribes to full finalized blocks with transactions included. Receives 1 block, logs its size in MB. Uses 128MB max decode size since blocks can be large |
-| 13 | **Subscribe Deshred** | Opens a `SubscribeDeshred` stream (the second streaming RPC). Deshred = reassembled-from-shreds transactions, available before block confirmation. Lowest-latency tx feed. Gracefully skips if the server doesn't support it |
-| 14 | **Keepalive** | Subscribes to slots for 40s. The server sends pings every ~15s — this test verifies we reply correctly and the connection stays alive through multiple ping/pong cycles |
-| 15 | **Re-subscribe** | Starts with a slots subscription, then sends a new `SubscribeRequest` on the same stream switching to blocks_meta. Verifies the old filter stops and the new one works |
-| 16 | **Unsubscribe** | Subscribes to slots, then sends empty filters (unsubscribe). Stays connected for 20s verifying the connection remains alive via ping/pong but no data arrives |
-| 17 | **Back Pressure** | Subscribes to transactions but reads slowly (3s sleep between reads). Verifies the proxy doesn't kill the connection when the client can't keep up |
-| 18 | **Soak** | Long-running stability test (off by default). Subscribes to slots + transactions + blocks_meta simultaneously for the configured duration. Prints per-minute stats: message counts, slot gaps, ping/pong health, errors |
+| 1 | `version` | Calls `GetVersion` RPC, logs the server version string |
+| 2 | `ping` | Calls `Ping` RPC with count=1, verifies the pong response matches |
+| 3 | `blockhash` | Calls `GetLatestBlockhash` at all 3 commitment levels (processed, confirmed, finalized), logs slot + blockhash |
+| 4 | `block-height` | Calls `GetBlockHeight` at all 3 commitment levels |
+| 5 | `slot` | Calls `GetSlot` at all 3 commitment levels |
+| 6 | `blockhash-valid` | Fetches a finalized blockhash, then validates it — checks the server says it's valid |
+| 7 | `replay-info` | Calls `SubscribeReplayInfo` RPC, logs the first available slot for replay |
+| 8 | `slots` | Opens a `Subscribe` stream with a slots filter (confirmed), waits for 3 slot updates |
+| 9 | `accounts` | Subscribes to the USDC mint account (`EPjFWdd5...`), waits for 1 account update, logs data length |
+| 10 | `transactions` | Subscribes to non-vote, non-failed transactions involving the System Program, waits for 3 |
+| 11 | `blocks-meta` | Subscribes to block metadata (confirmed), waits for 2, logs slot + blockhash + tx count |
+| 12 | `blocks` | Subscribes to full finalized blocks with transactions included. Receives 1 block, logs its size in MB. Uses 128MB max decode size since blocks can be large |
+| 13 | `deshred` | Opens a `SubscribeDeshred` stream (the second streaming RPC). Deshred = reassembled-from-shreds transactions, available before block confirmation. Lowest-latency tx feed. Gracefully skips if the server doesn't support it |
+| 14 | `keepalive` | Subscribes to slots for 40s. The server sends pings every ~15s — this test verifies we reply correctly and the connection stays alive through multiple ping/pong cycles |
+| 15 | `resubscribe` | Starts with a slots subscription, then sends a new `SubscribeRequest` on the same stream switching to blocks_meta. Verifies the old filter stops and the new one works |
+| 16 | `unsubscribe` | Subscribes to slots, then sends empty filters (unsubscribe). Stays connected for 20s verifying the connection remains alive via ping/pong but no data arrives |
+| 17 | `backpressure` | Subscribes to transactions but reads slowly (3s sleep between reads). Verifies the proxy doesn't kill the connection when the client can't keep up |
+| 18 | `soak` | Long-running stability test. Subscribes to slots + transactions + blocks_meta simultaneously for the configured duration. Prints per-minute stats: message counts, slot gaps, ping/pong health, errors |

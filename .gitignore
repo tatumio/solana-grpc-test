@@ -1,1 +1,12 @@
-/target
+# Rust
+debug/
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env

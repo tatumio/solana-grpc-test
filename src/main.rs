@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::env;
+use std::future::Future;
 use std::process;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use prost::Message as ProstMessage;
 use tokio::sync::mpsc;
@@ -24,40 +26,99 @@ const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const MAX_DECODE_SIZE: usize = 128 * 1024 * 1024;
 
-fn get_endpoint() -> String {
-    env::var("GRPC_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string())
+// --- CLI ---
+
+#[derive(Parser)]
+#[command(
+    name = "solana-grpc-test",
+    about = "Test suite for Solana Yellowstone gRPC endpoints"
+)]
+struct Cli {
+    /// gRPC endpoint URL
+    #[arg(short, long, env = "GRPC_ENDPOINT", default_value = DEFAULT_ENDPOINT)]
+    endpoint: String,
+
+    /// API key for authentication
+    #[arg(short = 'k', long, env = "API_KEY")]
+    api_key: Option<String>,
+
+    /// Auth header name
+    #[arg(short = 'H', long, env = "AUTH_HEADER", default_value = "x-api-key")]
+    auth_header: String,
+
+    /// Timeout for streaming tests (seconds)
+    #[arg(long, env = "STREAM_TIMEOUT_SECS", default_value = "30")]
+    stream_timeout: u64,
+
+    /// Timeout for full block reception (seconds)
+    #[arg(long, env = "BLOCK_TIMEOUT_SECS", default_value = "120")]
+    block_timeout: u64,
+
+    /// Keepalive test duration (seconds)
+    #[arg(long, env = "KEEPALIVE_TIMEOUT_SECS", default_value = "40")]
+    keepalive_timeout: u64,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-fn get_api_key() -> Result<String> {
-    env::var("API_KEY").context("API_KEY env var is required for authentication")
+#[derive(Subcommand)]
+enum Commands {
+    /// Run all tests (default)
+    All,
+    /// Run unary RPC tests only
+    Unary,
+    /// Run streaming subscription tests only
+    Stream,
+    /// Run advanced stream tests only
+    Advanced,
+    /// Run specific test(s) by name
+    Run {
+        /// Test names (see `list` for available names)
+        tests: Vec<String>,
+    },
+    /// Run long-running soak test
+    Soak {
+        /// Duration in seconds
+        #[arg(default_value = "7200")]
+        duration: u64,
+    },
+    /// List all available tests
+    List,
 }
 
-fn get_auth_header() -> String {
-    env::var("AUTH_HEADER").unwrap_or_else(|_| "x-api-key".to_string())
+// --- Config (global, populated from CLI) ---
+
+#[derive(Debug)]
+struct Config {
+    endpoint: String,
+    api_key: String,
+    auth_header: String,
+    stream_timeout: Duration,
+    block_timeout: Duration,
+    keepalive_timeout: Duration,
 }
 
-fn timeout_secs(env_name: &str, default: u64) -> Duration {
-    let secs = env::var(env_name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default);
-    Duration::from_secs(secs)
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+fn config() -> &'static Config {
+    CONFIG.get().expect("config not initialized")
 }
 
 fn stream_timeout() -> Duration {
-    timeout_secs("STREAM_TIMEOUT_SECS", 30)
+    config().stream_timeout
 }
 
 fn block_timeout() -> Duration {
-    timeout_secs("BLOCK_TIMEOUT_SECS", 120)
+    config().block_timeout
 }
 
 fn keepalive_timeout() -> Duration {
-    timeout_secs("KEEPALIVE_TIMEOUT_SECS", 40)
+    config().keepalive_timeout
 }
 
 async fn connect_channel() -> Result<Channel> {
-    let url = get_endpoint();
+    let url = config().endpoint.clone();
     let endpoint =
         Endpoint::from_shared(url)?.tls_config(ClientTlsConfig::new().with_native_roots())?;
     let channel = endpoint.connect().await?;
@@ -67,14 +128,15 @@ async fn connect_channel() -> Result<Channel> {
 macro_rules! connect {
     () => {{
         let channel = connect_channel().await?;
-        let api_key = get_api_key()?;
-        let header_name = get_auth_header();
-        let key: tonic::metadata::AsciiMetadataValue = api_key
+        let cfg = config();
+        let key: tonic::metadata::AsciiMetadataValue = cfg
+            .api_key
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid API key (not valid ASCII metadata)"))?;
-        let header: tonic::metadata::AsciiMetadataKey = header_name
+        let header: tonic::metadata::AsciiMetadataKey = cfg
+            .auth_header
             .parse()
-            .map_err(|_| anyhow::anyhow!("invalid auth header name: {header_name}"))?;
+            .map_err(|_| anyhow::anyhow!("invalid auth header name: {}", cfg.auth_header))?;
         GeyserClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert(header.clone(), key.clone());
             Ok(req)
@@ -926,9 +988,8 @@ async fn test_back_pressure() -> Result<String> {
     ))
 }
 
-/// Soak test: run all subscriptions for an extended period (default 2 hours).
+/// Soak test: run all subscriptions for an extended period.
 /// Monitors for connection drops, message gaps, parse errors, and throughput.
-/// Enable with SOAK=1 env var. Duration via SOAK_DURATION_SECS (default 7200).
 async fn test_soak(duration_secs: u64) -> Result<String> {
     let duration = Duration::from_secs(duration_secs);
     let report_interval = Duration::from_secs(60);
@@ -1026,6 +1087,133 @@ async fn test_soak(duration_secs: u64) -> Result<String> {
     ))
 }
 
+// --- Test Registry ---
+
+const UNARY_TESTS: &[(&str, &str)] = &[
+    ("version", "GetVersion"),
+    ("ping", "Ping"),
+    ("blockhash", "GetLatestBlockhash"),
+    ("block-height", "GetBlockHeight"),
+    ("slot", "GetSlot"),
+    ("blockhash-valid", "IsBlockhashValid"),
+    ("replay-info", "SubscribeReplayInfo"),
+];
+
+const STREAM_TESTS: &[(&str, &str)] = &[
+    ("slots", "Subscribe Slots"),
+    ("accounts", "Subscribe Accounts (USDC)"),
+    ("transactions", "Subscribe Transactions (System)"),
+    ("blocks-meta", "Subscribe Blocks Meta"),
+    ("blocks", "Subscribe Full Block"),
+    ("deshred", "Subscribe Deshred (txs)"),
+];
+
+const ADVANCED_TESTS: &[(&str, &str)] = &[
+    ("keepalive", "Keepalive (ping/pong)"),
+    ("resubscribe", "Re-subscribe (slots -> blocks_meta)"),
+    ("unsubscribe", "Unsubscribe (empty filters)"),
+    ("backpressure", "Back Pressure (slow reader)"),
+];
+
+async fn run_test_by_name(t: &mut TestRunner, name: &str) -> bool {
+    match name {
+        "version" => t.run("GetVersion", test_get_version()).await,
+        "ping" => t.run("Ping", test_ping()).await,
+        "blockhash" => {
+            t.run("GetLatestBlockhash", test_get_latest_blockhash())
+                .await
+        }
+        "block-height" => t.run("GetBlockHeight", test_get_block_height()).await,
+        "slot" => t.run("GetSlot", test_get_slot()).await,
+        "blockhash-valid" => t.run("IsBlockhashValid", test_is_blockhash_valid()).await,
+        "replay-info" => {
+            t.run("SubscribeReplayInfo", test_subscribe_replay_info())
+                .await
+        }
+        "slots" => t.run("Subscribe Slots", test_subscribe_slots()).await,
+        "accounts" => {
+            t.run("Subscribe Accounts (USDC)", test_subscribe_accounts())
+                .await
+        }
+        "transactions" => {
+            t.run(
+                "Subscribe Transactions (System)",
+                test_subscribe_transactions(),
+            )
+            .await
+        }
+        "blocks-meta" => {
+            t.run("Subscribe Blocks Meta", test_subscribe_blocks_meta())
+                .await
+        }
+        "blocks" => {
+            t.run("Subscribe Full Block", test_subscribe_full_block())
+                .await
+        }
+        "deshred" => {
+            t.run("Subscribe Deshred (txs)", test_subscribe_deshred())
+                .await
+        }
+        "keepalive" => t.run("Keepalive (ping/pong)", test_keepalive()).await,
+        "resubscribe" => {
+            t.run("Re-subscribe (slots -> blocks_meta)", test_resubscribe())
+                .await
+        }
+        "unsubscribe" => {
+            t.run("Unsubscribe (empty filters)", test_unsubscribe())
+                .await
+        }
+        "backpressure" => {
+            t.run("Back Pressure (slow reader)", test_back_pressure())
+                .await
+        }
+        _ => {
+            eprintln!("unknown test: {name}");
+            eprintln!("run `solana-grpc-test list` to see available tests");
+            return false;
+        }
+    }
+    true
+}
+
+async fn run_group(t: &mut TestRunner, tests: &[(&str, &str)], label: &str) {
+    println!("--- {label} ---");
+    for &(name, _) in tests {
+        run_test_by_name(t, name).await;
+    }
+}
+
+async fn run_all(t: &mut TestRunner) {
+    run_group(t, UNARY_TESTS, "Unary RPCs").await;
+    println!();
+    run_group(t, STREAM_TESTS, "Streaming Subscriptions").await;
+    println!();
+    run_group(t, ADVANCED_TESTS, "Advanced Stream Tests").await;
+}
+
+fn print_test_list() {
+    println!("Available tests:\n");
+    println!("  Groups:");
+    println!("    all         Run all tests");
+    println!("    unary       Run unary RPC tests");
+    println!("    stream      Run streaming subscription tests");
+    println!("    advanced    Run advanced stream tests\n");
+    println!("  Unary RPCs:");
+    for &(name, desc) in UNARY_TESTS {
+        println!("    {name:<16}{desc}");
+    }
+    println!("\n  Streaming Subscriptions:");
+    for &(name, desc) in STREAM_TESTS {
+        println!("    {name:<16}{desc}");
+    }
+    println!("\n  Advanced:");
+    for &(name, desc) in ADVANCED_TESTS {
+        println!("    {name:<16}{desc}");
+    }
+    println!("\n  Long-running:");
+    println!("    soak          Soak test (use `soak` subcommand)");
+}
+
 // --- Main ---
 
 #[tokio::main]
@@ -1034,74 +1222,71 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let endpoint = get_endpoint();
-    let auth_header = get_auth_header();
+    let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Commands::List)) {
+        print_test_list();
+        return;
+    }
+
+    let api_key = cli.api_key.unwrap_or_else(|| {
+        eprintln!("error: --api-key <API_KEY> (or API_KEY env var) is required");
+        process::exit(2);
+    });
+
+    CONFIG
+        .set(Config {
+            endpoint: cli.endpoint,
+            api_key,
+            auth_header: cli.auth_header,
+            stream_timeout: Duration::from_secs(cli.stream_timeout),
+            block_timeout: Duration::from_secs(cli.block_timeout),
+            keepalive_timeout: Duration::from_secs(cli.keepalive_timeout),
+        })
+        .expect("config already set");
+
+    let cfg = config();
     println!("=== Yellowstone gRPC Proxy Test ===");
-    println!("Endpoint: {endpoint}");
-    println!("Auth header: {auth_header}");
+    println!("Endpoint: {}", cfg.endpoint);
+    println!("Auth header: {}", cfg.auth_header);
     println!(
         "Timeouts: stream={}s block={}s keepalive={}s",
-        stream_timeout().as_secs(),
-        block_timeout().as_secs(),
-        keepalive_timeout().as_secs()
+        cfg.stream_timeout.as_secs(),
+        cfg.block_timeout.as_secs(),
+        cfg.keepalive_timeout.as_secs()
     );
     println!();
 
     let mut t = TestRunner::new();
 
-    println!("--- Unary RPCs ---");
-    t.run("GetVersion", test_get_version()).await;
-    t.run("Ping", test_ping()).await;
-    t.run("GetLatestBlockhash", test_get_latest_blockhash())
-        .await;
-    t.run("GetBlockHeight", test_get_block_height()).await;
-    t.run("GetSlot", test_get_slot()).await;
-    t.run("IsBlockhashValid", test_is_blockhash_valid()).await;
-    t.run("SubscribeReplayInfo", test_subscribe_replay_info())
-        .await;
-
-    println!();
-    println!("--- Streaming Subscriptions ---");
-    t.run("Subscribe Slots", test_subscribe_slots()).await;
-    t.run("Subscribe Accounts (USDC)", test_subscribe_accounts())
-        .await;
-    t.run(
-        "Subscribe Transactions (System)",
-        test_subscribe_transactions(),
-    )
-    .await;
-    t.run("Subscribe Blocks Meta", test_subscribe_blocks_meta())
-        .await;
-    t.run("Subscribe Full Block", test_subscribe_full_block())
-        .await;
-    t.run("Subscribe Deshred (txs)", test_subscribe_deshred())
-        .await;
-
-    println!();
-    println!("--- Advanced Stream Tests ---");
-    t.run("Keepalive (ping/pong)", test_keepalive()).await;
-    t.run("Re-subscribe (slots -> blocks_meta)", test_resubscribe())
-        .await;
-    t.run("Unsubscribe (empty filters)", test_unsubscribe())
-        .await;
-    t.run("Back Pressure (slow reader)", test_back_pressure())
-        .await;
-
-    t.summary();
-
-    // Soak test: long-running stability test (enable with SOAK_DURATION_SECS=7200)
-    let soak_secs = env::var("SOAK_DURATION_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if soak_secs > 0 {
-        println!();
-        println!("--- Soak Test ---");
-        t.run("Soak (long-running stability)", test_soak(soak_secs))
-            .await;
-        println!();
-        t.summary();
+    match cli.command {
+        None | Some(Commands::All) => {
+            run_all(&mut t).await;
+        }
+        Some(Commands::Unary) => {
+            run_group(&mut t, UNARY_TESTS, "Unary RPCs").await;
+        }
+        Some(Commands::Stream) => {
+            run_group(&mut t, STREAM_TESTS, "Streaming Subscriptions").await;
+        }
+        Some(Commands::Advanced) => {
+            run_group(&mut t, ADVANCED_TESTS, "Advanced Stream Tests").await;
+        }
+        Some(Commands::Run { tests }) => {
+            for name in &tests {
+                if !run_test_by_name(&mut t, name).await {
+                    process::exit(2);
+                }
+            }
+        }
+        Some(Commands::Soak { duration }) => {
+            println!("--- Soak Test ---");
+            t.run("Soak (long-running stability)", test_soak(duration))
+                .await;
+        }
+        Some(Commands::List) => unreachable!(),
     }
 
+    t.summary();
     process::exit(t.exit_code());
 }

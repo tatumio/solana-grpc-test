@@ -12,3 +12,4 @@ anyhow = "1"
 prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-stream = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
