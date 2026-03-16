@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long, env = "KEEPALIVE_TIMEOUT_SECS", default_value = "40")]
     keepalive_timeout: u64,
 
+    /// Max concurrent streams for stress test
+    #[arg(long, env = "MAX_STREAMS", default_value = "100")]
+    max_streams: u64,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -83,6 +87,12 @@ enum Commands {
         #[arg(default_value = "7200")]
         duration: u64,
     },
+    /// Open many concurrent streams to find the server limit
+    Stress {
+        /// Number of streams to open
+        #[arg(default_value = "100")]
+        count: u64,
+    },
     /// List all available tests
     List,
 }
@@ -97,6 +107,7 @@ struct Config {
     stream_timeout: Duration,
     block_timeout: Duration,
     keepalive_timeout: Duration,
+    max_streams: u64,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -988,6 +999,82 @@ async fn test_back_pressure() -> Result<String> {
     ))
 }
 
+/// Stream flood: open many concurrent streams to find the server limit.
+/// Each stream subscribes to confirmed slots.
+async fn test_stream_flood(max_streams: u64) -> Result<String> {
+    println!("         opening up to {max_streams} concurrent streams...");
+    let mut streams: Vec<GeyserStream> = Vec::new();
+    let mut first_error: Option<(u64, String)> = None;
+    let connect_start = Instant::now();
+
+    for i in 1..=max_streams {
+        let request = SubscribeRequest {
+            slots: HashMap::from([(
+                format!("flood_{i}"),
+                SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            ..Default::default()
+        };
+
+        match GeyserStream::connect(request).await {
+            Ok(sub) => {
+                streams.push(sub);
+                if i % 10 == 0 {
+                    println!("         [{i}/{max_streams}] opened successfully");
+                }
+            }
+            Err(e) => {
+                first_error = Some((i, format!("{e:#}")));
+                println!("         [{i}/{max_streams}] FAILED: {e:#}");
+                break;
+            }
+        }
+    }
+
+    let opened = streams.len() as u64;
+    let connect_elapsed = connect_start.elapsed();
+    println!("         opened {opened}/{max_streams} in {connect_elapsed:.1?}");
+
+    if streams.is_empty() {
+        bail!("could not open any streams");
+    }
+
+    // Read one update from each concurrently to verify that the streams are healthy.
+    println!("         verifying {opened} streams receive data...");
+    let mut handles = Vec::new();
+    for mut sub in streams {
+        handles.push(tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(15), sub.next_data()).await
+        }));
+    }
+    let results = futures::future::join_all(handles).await;
+    let healthy = results
+        .iter()
+        .filter(|r| matches!(r, Ok(Ok(Ok(Some(_))))))
+        .count() as u64;
+    let timed_out = results
+        .iter()
+        .filter(|r| matches!(r, Ok(Err(_))))
+        .count() as u64;
+    let errored = results
+        .iter()
+        .filter(|r| matches!(r, Ok(Ok(Err(_)))))
+        .count() as u64;
+
+    let mut detail = format!(
+        "opened={opened}/{max_streams} healthy={healthy} timed_out={timed_out} errored={errored} connect_time={connect_elapsed:.1?}"
+    );
+    if let Some((at, err)) = &first_error {
+        detail.push_str(&format!("\n         first failure at stream #{at}: {err}"));
+    }
+
+    Ok(detail)
+}
+
 /// Soak test: run all subscriptions for an extended period.
 /// Monitors for connection drops, message gaps, parse errors, and throughput.
 async fn test_soak(duration_secs: u64) -> Result<String> {
@@ -1113,6 +1200,7 @@ const ADVANCED_TESTS: &[(&str, &str)] = &[
     ("resubscribe", "Re-subscribe (slots -> blocks_meta)"),
     ("unsubscribe", "Unsubscribe (empty filters)"),
     ("backpressure", "Back Pressure (slow reader)"),
+    ("streams", "Stream Flood (concurrent)"),
 ];
 
 async fn run_test_by_name(t: &mut TestRunner, name: &str) -> bool {
@@ -1167,6 +1255,13 @@ async fn run_test_by_name(t: &mut TestRunner, name: &str) -> bool {
             t.run("Back Pressure (slow reader)", test_back_pressure())
                 .await
         }
+        "streams" => {
+            t.run(
+                "Stream Flood (concurrent)",
+                test_stream_flood(config().max_streams),
+            )
+            .await
+        }
         _ => {
             eprintln!("unknown test: {name}");
             eprintln!("run `solana-grpc-test list` to see available tests");
@@ -1210,8 +1305,9 @@ fn print_test_list() {
     for &(name, desc) in ADVANCED_TESTS {
         println!("    {name:<16}{desc}");
     }
-    println!("\n  Long-running:");
+    println!("\n  Long-running / stress:");
     println!("    soak          Soak test (use `soak` subcommand)");
+    println!("    stress        Stream flood (use `stress` subcommand)");
 }
 
 // --- Main ---
@@ -1242,6 +1338,7 @@ async fn main() {
             stream_timeout: Duration::from_secs(cli.stream_timeout),
             block_timeout: Duration::from_secs(cli.block_timeout),
             keepalive_timeout: Duration::from_secs(cli.keepalive_timeout),
+            max_streams: cli.max_streams,
         })
         .expect("config already set");
 
@@ -1282,6 +1379,11 @@ async fn main() {
         Some(Commands::Soak { duration }) => {
             println!("--- Soak Test ---");
             t.run("Soak (long-running stability)", test_soak(duration))
+                .await;
+        }
+        Some(Commands::Stress { count }) => {
+            println!("--- Stream Stress Test ---");
+            t.run("Stream Flood (concurrent)", test_stream_flood(count))
                 .await;
         }
         Some(Commands::List) => unreachable!(),

@@ -41,6 +41,9 @@ solana-grpc-test -k <api-key> run version ping slots
 # 2-hour soak test
 solana-grpc-test -k <api-key> soak 7200
 
+# Stress test: open 200 concurrent streams
+solana-grpc-test -k <api-key> stress 200
+
 # List all available tests
 solana-grpc-test list
 ```
@@ -68,17 +71,19 @@ API_KEY=<key> GRPC_ENDPOINT=https://your-endpoint.com cargo run
 | `--stream-timeout` | `STREAM_TIMEOUT_SECS` | `30` | Timeout for streaming tests (seconds) |
 | `--block-timeout` | `BLOCK_TIMEOUT_SECS` | `120` | Timeout for full block reception (seconds) |
 | `--keepalive-timeout` | `KEEPALIVE_TIMEOUT_SECS` | `40` | Keepalive test duration (seconds) |
+| `--max-streams` | `MAX_STREAMS` | `100` | Number of concurrent streams for stress test |
 
 ## Subcommands
 
 | Command | Description |
 |---|---|
-| _(none)_ / `all` | Run all 17 tests |
+| _(none)_ / `all` | Run all 18 tests |
 | `unary` | Run unary RPC tests only |
 | `stream` | Run streaming subscription tests only |
 | `advanced` | Run advanced stream tests only |
 | `run <test>...` | Run specific test(s) by name |
 | `soak [seconds]` | Long-running soak test (default: 7200s = 2 hours) |
+| `stress [count]` | Open many concurrent streams to find the server limit (default: 100) |
 | `list` | List all available test names |
 
 ## Tests
@@ -104,4 +109,5 @@ Each test maps 1:1 to a function in `src/main.rs`.
 | 15 | `resubscribe` | Starts with a slots subscription, then sends a new `SubscribeRequest` on the same stream switching to blocks_meta. Verifies the old filter stops and the new one works |
 | 16 | `unsubscribe` | Subscribes to slots, then sends empty filters (unsubscribe). Stays connected for 20s verifying the connection remains alive via ping/pong but no data arrives |
 | 17 | `backpressure` | Subscribes to transactions but reads slowly (3s sleep between reads). Verifies the proxy doesn't kill the connection when the client can't keep up |
-| 18 | `soak` | Long-running stability test. Subscribes to slots + transactions + blocks_meta simultaneously for the configured duration. Prints per-minute stats: message counts, slot gaps, ping/pong health, errors |
+| 18 | `streams` | Opens N concurrent streams (each subscribing to slots) to find the server limit. Reports how many opened successfully and verifies they all receive data. Configurable via `--max-streams` or `stress` subcommand |
+| 19 | `soak` | Long-running stability test. Subscribes to slots + transactions + blocks_meta simultaneously for the configured duration. Prints per-minute stats: message counts, slot gaps, ping/pong health, errors |
