@@ -58,9 +58,13 @@ struct Cli {
     #[arg(long, env = "KEEPALIVE_TIMEOUT_SECS", default_value = "40")]
     keepalive_timeout: u64,
 
-    /// Max concurrent streams for stress test
-    #[arg(long, env = "MAX_STREAMS", default_value = "100")]
-    max_streams: u64,
+    /// Number of TCP connections for stress test
+    #[arg(long, env = "STRESS_CONNECTIONS", default_value = "10")]
+    stress_connections: u64,
+
+    /// Number of gRPC streams per connection for stress test
+    #[arg(long, env = "STRESS_STREAMS", default_value = "10")]
+    stress_streams: u64,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -89,9 +93,12 @@ enum Commands {
     },
     /// Open many concurrent streams to find the server limit
     Stress {
-        /// Number of streams to open
-        #[arg(default_value = "100")]
-        count: u64,
+        /// Number of TCP connections
+        #[arg(default_value = "10")]
+        connections: u64,
+        /// Number of gRPC streams per connection
+        #[arg(default_value = "10")]
+        streams_per_conn: u64,
     },
     /// List all available tests
     List,
@@ -107,7 +114,8 @@ struct Config {
     stream_timeout: Duration,
     block_timeout: Duration,
     keepalive_timeout: Duration,
-    max_streams: u64,
+    stress_connections: u64,
+    stress_streams: u64,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -136,9 +144,8 @@ async fn connect_channel() -> Result<Channel> {
     Ok(channel)
 }
 
-macro_rules! connect {
-    () => {{
-        let channel = connect_channel().await?;
+macro_rules! connect_client {
+    ($channel:expr) => {{
         let cfg = config();
         let key: tonic::metadata::AsciiMetadataValue = cfg
             .api_key
@@ -148,11 +155,18 @@ macro_rules! connect {
             .auth_header
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid auth header name: {}", cfg.auth_header))?;
-        GeyserClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        GeyserClient::with_interceptor($channel, move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert(header.clone(), key.clone());
             Ok(req)
         })
         .max_decoding_message_size(MAX_DECODE_SIZE)
+    }};
+}
+
+macro_rules! connect {
+    () => {{
+        let channel = connect_channel().await?;
+        connect_client!(channel)
     }};
 }
 
@@ -999,62 +1013,114 @@ async fn test_back_pressure() -> Result<String> {
     ))
 }
 
-/// Stream flood: open many concurrent streams to find the server limit.
-/// Each stream subscribes to confirmed slots.
-async fn test_stream_flood(max_streams: u64) -> Result<String> {
-    println!("         opening up to {max_streams} concurrent streams...");
-    let mut streams: Vec<GeyserStream> = Vec::new();
-    let mut first_error: Option<(u64, String)> = None;
+/// Stream flood: open many connections, each with multiple gRPC streams.
+/// Tests both the connection limit and the per-connection stream limit.
+async fn test_stream_flood(num_connections: u64, streams_per_conn: u64) -> Result<String> {
+    let total_target = num_connections * streams_per_conn;
+    println!(
+        "         target: {num_connections} connections × {streams_per_conn} streams = {total_target} total"
+    );
+
+    let mut all_txs: Vec<mpsc::Sender<SubscribeRequest>> = Vec::new();
+    let mut all_streams: Vec<tonic::Streaming<SubscribeUpdate>> = Vec::new();
+    let mut connections_opened = 0u64;
+    let mut first_error: Option<String> = None;
     let connect_start = Instant::now();
 
-    for i in 1..=max_streams {
-        let request = SubscribeRequest {
-            slots: HashMap::from([(
-                format!("flood_{i}"),
-                SubscribeRequestFilterSlots {
-                    filter_by_commitment: Some(true),
-                    ..Default::default()
-                },
-            )]),
-            commitment: Some(CommitmentLevel::Confirmed as i32),
-            ..Default::default()
-        };
-
-        match GeyserStream::connect(request).await {
-            Ok(sub) => {
-                streams.push(sub);
-                if i % 10 == 0 {
-                    println!("         [{i}/{max_streams}] opened successfully");
-                }
-            }
+    'outer: for c in 1..=num_connections {
+        let channel = match connect_channel().await {
+            Ok(ch) => ch,
             Err(e) => {
-                first_error = Some((i, format!("{e:#}")));
-                println!("         [{i}/{max_streams}] FAILED: {e:#}");
+                first_error = Some(format!("connection {c} failed: {e:#}"));
+                println!("         connection {c}/{num_connections} FAILED: {e:#}");
                 break;
             }
+        };
+        connections_opened += 1;
+        let mut client = connect_client!(channel);
+
+        for s in 1..=streams_per_conn {
+            let (tx, rx) = mpsc::channel::<SubscribeRequest>(16);
+            let request = SubscribeRequest {
+                slots: HashMap::from([(
+                    format!("flood_{c}_{s}"),
+                    SubscribeRequestFilterSlots {
+                        filter_by_commitment: Some(true),
+                        ..Default::default()
+                    },
+                )]),
+                commitment: Some(CommitmentLevel::Confirmed as i32),
+                ..Default::default()
+            };
+            if tx.send(request).await.is_err() {
+                first_error = Some(format!("conn {c} stream {s}: send failed"));
+                break 'outer;
+            }
+
+            match client.subscribe(ReceiverStream::new(rx)).await {
+                Ok(resp) => {
+                    all_txs.push(tx);
+                    all_streams.push(resp.into_inner());
+                }
+                Err(e) => {
+                    let so_far = all_streams.len();
+                    first_error =
+                        Some(format!("conn {c} stream {s} ({so_far} total open): {e:#}"));
+                    println!(
+                        "         conn {c} stream {s} FAILED ({so_far} total open): {e:#}"
+                    );
+                    break 'outer;
+                }
+            }
+        }
+
+        let so_far = all_streams.len();
+        if c % 5 == 0 || c == 1 {
+            println!("         [{c}/{num_connections}] {so_far} streams open");
         }
     }
 
-    let opened = streams.len() as u64;
+    let opened = all_streams.len() as u64;
     let connect_elapsed = connect_start.elapsed();
-    println!("         opened {opened}/{max_streams} in {connect_elapsed:.1?}");
+    println!(
+        "         {connections_opened} connections, {opened}/{total_target} streams in {connect_elapsed:.1?}"
+    );
 
-    if streams.is_empty() {
+    if all_streams.is_empty() {
         bail!("could not open any streams");
     }
 
     // Read one update from each concurrently to verify that the streams are healthy.
     println!("         verifying {opened} streams receive data...");
     let mut handles = Vec::new();
-    for mut sub in streams {
+    for (tx, mut stream) in all_txs.into_iter().zip(all_streams) {
         handles.push(tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(15), sub.next_data()).await
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while let Some(msg) = stream.next().await {
+                    let msg = msg?;
+                    match msg.update_oneof {
+                        Some(UpdateOneof::Ping(_)) => {
+                            let _ = tx
+                                .send(SubscribeRequest {
+                                    ping: Some(SubscribeRequestPing { id: 1 }),
+                                    ..Default::default()
+                                })
+                                .await;
+                        }
+                        Some(UpdateOneof::Pong(_)) => {}
+                        Some(_) => return Ok::<_, anyhow::Error>(true),
+                        None => {}
+                    }
+                }
+                Ok(false)
+            })
+            .await
         }));
     }
     let results = futures::future::join_all(handles).await;
     let healthy = results
         .iter()
-        .filter(|r| matches!(r, Ok(Ok(Ok(Some(_))))))
+        .filter(|r| matches!(r, Ok(Ok(Ok(true)))))
         .count() as u64;
     let timed_out = results
         .iter()
@@ -1066,10 +1132,10 @@ async fn test_stream_flood(max_streams: u64) -> Result<String> {
         .count() as u64;
 
     let mut detail = format!(
-        "opened={opened}/{max_streams} healthy={healthy} timed_out={timed_out} errored={errored} connect_time={connect_elapsed:.1?}"
+        "connections={connections_opened}/{num_connections} streams={opened}/{total_target} healthy={healthy} timed_out={timed_out} errored={errored} connect_time={connect_elapsed:.1?}"
     );
-    if let Some((at, err)) = &first_error {
-        detail.push_str(&format!("\n         first failure at stream #{at}: {err}"));
+    if let Some(err) = &first_error {
+        detail.push_str(&format!("\n         first failure: {err}"));
     }
 
     Ok(detail)
@@ -1258,7 +1324,7 @@ async fn run_test_by_name(t: &mut TestRunner, name: &str) -> bool {
         "streams" => {
             t.run(
                 "Stream Flood (concurrent)",
-                test_stream_flood(config().max_streams),
+                test_stream_flood(config().stress_connections, config().stress_streams),
             )
             .await
         }
@@ -1338,7 +1404,8 @@ async fn main() {
             stream_timeout: Duration::from_secs(cli.stream_timeout),
             block_timeout: Duration::from_secs(cli.block_timeout),
             keepalive_timeout: Duration::from_secs(cli.keepalive_timeout),
-            max_streams: cli.max_streams,
+            stress_connections: cli.stress_connections,
+            stress_streams: cli.stress_streams,
         })
         .expect("config already set");
 
@@ -1381,10 +1448,16 @@ async fn main() {
             t.run("Soak (long-running stability)", test_soak(duration))
                 .await;
         }
-        Some(Commands::Stress { count }) => {
+        Some(Commands::Stress {
+            connections,
+            streams_per_conn,
+        }) => {
             println!("--- Stream Stress Test ---");
-            t.run("Stream Flood (concurrent)", test_stream_flood(count))
-                .await;
+            t.run(
+                "Stream Flood (concurrent)",
+                test_stream_flood(connections, streams_per_conn),
+            )
+            .await;
         }
         Some(Commands::List) => unreachable!(),
     }
