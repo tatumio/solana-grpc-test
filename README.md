@@ -44,6 +44,16 @@ solana-grpc-test -k <api-key> soak 7200
 # Stress test: 20 connections × 10 streams each = 200 total
 solana-grpc-test -k <api-key> stress 20 10
 
+# Compare latency between two endpoints (60s)
+solana-grpc-test latency \
+  "tatum,https://solana-mainnet-grpc.gateway.tatum.dev,x-api-key,YOUR_KEY" \
+  "shyft,https://grpc.us.shyft.to:443,x-token,YOUR_KEY"
+
+# Latency comparison for 120 seconds
+solana-grpc-test latency -d 120 \
+  "tatum,https://solana-mainnet-grpc.gateway.tatum.dev,x-api-key,KEY1" \
+  "shyft,https://grpc.us.shyft.to:443,x-token,KEY2"
+
 # List all available tests
 solana-grpc-test list
 ```
@@ -85,6 +95,8 @@ API_KEY=<key> GRPC_ENDPOINT=https://your-endpoint.com cargo run
 | `run <test>...` | Run specific test(s) by name |
 | `soak [seconds]` | Long-running soak test (default: 7200s = 2 hours) |
 | `stress [connections] [streams-per-conn]` | Open many concurrent streams to find the server limit (default: 10×10) |
+| `goaway [seconds]` | Ping flood on single connection to detect GOAWAY (default: 7200s = 2 hours) |
+| `latency [-d secs] <target>...` | Compare slot/block delivery latency between endpoints. Target format: `name,url,header,key` |
 | `list` | List all available test names |
 
 ## Tests
@@ -112,3 +124,4 @@ Each test maps 1:1 to a function in `src/main.rs`.
 | 17 | `backpressure` | Subscribes to transactions but reads slowly (3s sleep between reads). Verifies the proxy doesn't kill the connection when the client can't keep up |
 | 18 | `streams` | Opens C connections × S streams each (all subscribing to slots) to find both the connection limit and per-connection stream limit. Verifies all streams receive data. Use `stress <connections> <streams-per-conn>` subcommand or `--stress-connections` / `--stress-streams` flags |
 | 19 | `soak` | Long-running stability test. Subscribes to slots + transactions + blocks_meta simultaneously for the configured duration. Prints per-minute stats: message counts, slot gaps, ping/pong health, errors |
+| 20 | `goaway` | Sends 1 gRPC ping/sec on a single connection for 2+ hours. Monitors for HTTP/2 GOAWAY frames, stream resets, or connection drops. Reports when/if the connection dies and whether GOAWAY was the cause |

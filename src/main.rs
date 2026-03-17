@@ -100,6 +100,20 @@ enum Commands {
         #[arg(default_value = "10")]
         streams_per_conn: u64,
     },
+    /// Ping flood on single connection to detect GOAWAY
+    Goaway {
+        /// Duration in seconds (default: 2 hours)
+        #[arg(default_value = "7200")]
+        duration: u64,
+    },
+    /// Compare latency between multiple endpoints
+    Latency {
+        /// Duration in seconds
+        #[arg(short, long, default_value = "60")]
+        duration: u64,
+        /// Targets: name,url,header,key (one per arg)
+        targets: Vec<String>,
+    },
     /// List all available tests
     List,
 }
@@ -1240,6 +1254,583 @@ async fn test_soak(duration_secs: u64) -> Result<String> {
     ))
 }
 
+/// GOAWAY detection: ping flood on a single connection.
+/// Sends 1 ping/sec and monitors for connection drops or GOAWAY frames.
+async fn test_goaway(duration_secs: u64) -> Result<String> {
+    let duration = Duration::from_secs(duration_secs);
+
+    println!(
+        "         ping flood: 1 ping/sec for {}h{}m on single connection...",
+        duration_secs / 3600,
+        (duration_secs % 3600) / 60
+    );
+
+    // Use raw stream (not GeyserStream) so we can send pings and read concurrently
+    let mut client = connect!();
+    let ping_client = client.clone();
+    let (tx, rx) = mpsc::channel::<SubscribeRequest>(16);
+    let (unary_err_tx, mut unary_err_rx) = tokio::sync::mpsc::channel::<tonic::Status>(16);
+    let request = SubscribeRequest {
+        slots: HashMap::from([(
+            "goaway_slots".to_string(),
+            SubscribeRequestFilterSlots {
+                filter_by_commitment: Some(true),
+                ..Default::default()
+            },
+        )]),
+        commitment: Some(CommitmentLevel::Confirmed as i32),
+        ..Default::default()
+    };
+    tx.send(request)
+        .await
+        .map_err(|_| anyhow::anyhow!("send failed"))?;
+
+    let mut stream = client
+        .subscribe(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+
+    let mut ping_counter = 0i32;
+    let mut pings_sent = 0u64;
+    let mut pongs_received = 0u64;
+    let mut server_pings = 0u64;
+    let mut slot_count = 0u64;
+    let mut goaway_detected = false;
+    let mut exit_reason = "duration elapsed";
+    let start = Instant::now();
+
+    let mut ping_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut report_tick = tokio::time::interval(Duration::from_secs(60));
+    report_tick.tick().await; // skip immediate first tick
+
+    let mut first_slot_logged = false;
+    let mut last_unary_err_log = Instant::now() - Duration::from_secs(60);
+
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            _ = ping_tick.tick() => {
+                pings_sent += 1;
+                ping_counter += 1;
+                if tx.send(SubscribeRequest {
+                    ping: Some(SubscribeRequestPing { id: ping_counter }),
+                    ..Default::default()
+                }).await.is_err() {
+                    exit_reason = "send channel closed";
+                    println!(
+                        "         [{:.0}m] SEND FAILED — channel closed",
+                        start.elapsed().as_secs_f64() / 60.0
+                    );
+                    break;
+                }
+
+                // Probe for GOAWAY by attempting to open a new stream via Unary Ping
+                let mut p_client = ping_client.clone();
+                let p_tx = unary_err_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = p_client.ping(yellowstone_grpc_proto::geyser::PingRequest { count: 1 }).await {
+                        let _ = p_tx.send(e).await;
+                    }
+                });
+            }
+            Some(err) = unary_err_rx.recv() => {
+                let all_text = format!("{err:#} {err:?}").to_lowercase();
+                if all_text.contains("goaway") || all_text.contains("go_away") || all_text.contains("connection closed") || all_text.contains("transport error") {
+                    let mins = start.elapsed().as_secs_f64() / 60.0;
+                    println!("         [{mins:.0}m] UNARY PING ERROR (GOAWAY Probe):");
+                    println!("           message: {}", err.message());
+                    goaway_detected = true;
+                    exit_reason = "goaway (detected by unary ping)";
+                    break;
+                } else {
+                    // Likely an upstream error 
+                    // Log it periodically but don't break the test
+                    if last_unary_err_log.elapsed().as_secs() >= 30 {
+                        let mins = start.elapsed().as_secs_f64() / 60.0;
+                        println!("         [{mins:.1}m] [WARNING] Unary ping failed: {} (suppressing further errors for 30s)", err.message());
+                        last_unary_err_log = Instant::now();
+                    }
+                }
+            }
+            _ = report_tick.tick() => {
+                let secs = start.elapsed().as_secs();
+                println!(
+                    "         [{:02}:{:02}:{:02}] pings={pings_sent} pongs={pongs_received} srv_pings={server_pings} slots={slot_count}",
+                    secs / 3600, (secs % 3600) / 60, secs % 60
+                );
+                if slot_count == 0 && pongs_received > 0 {
+                    println!("         [WARNING] 0 slots received! Gateway is responding to pings, but backend node might be down.");
+                }
+            }
+            msg = stream.next() => {
+                match msg {
+                    None => {
+                        goaway_detected = true;
+                        exit_reason = "stream closed";
+                        println!(
+                            "         [{:.0}m] STREAM CLOSED — likely GOAWAY",
+                            start.elapsed().as_secs_f64() / 60.0
+                        );
+                        break;
+                    }
+                    Some(Ok(msg)) => {
+                        match msg.update_oneof {
+                            Some(UpdateOneof::Ping(_)) => {
+                                server_pings += 1;
+                                ping_counter += 1;
+                                let _ = tx.send(SubscribeRequest {
+                                    ping: Some(SubscribeRequestPing { id: ping_counter }),
+                                    ..Default::default()
+                                }).await;
+                            }
+                            Some(UpdateOneof::Pong(_)) => {
+                                pongs_received += 1;
+                            }
+                            Some(UpdateOneof::Slot(_)) => {
+                                slot_count += 1;
+                                if !first_slot_logged {
+                                    println!("         [{:.1}s] [INFO] First slot received! Upstream is healthy and streaming data.", start.elapsed().as_secs_f64());
+                                    first_slot_logged = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let mins = start.elapsed().as_secs_f64() / 60.0;
+                        println!("         [{mins:.0}m] CONNECTION ERROR:");
+                        println!("           gRPC code: {:?}", e.code());
+                        println!("           message: {}", e.message());
+                        // Walk the error source chain for h2/transport details
+                        let mut source: Option<&dyn std::error::Error> =
+                            std::error::Error::source(&e);
+                        let mut depth = 0;
+                        while let Some(err) = source {
+                            depth += 1;
+                            println!("           cause [{depth}]: {err}");
+                            // Debug format may reveal h2 error codes/reason
+                            let dbg = format!("{err:?}");
+                            if dbg != format!("{err}") {
+                                println!("           debug [{depth}]: {dbg}");
+                            }
+                            source = err.source();
+                        }
+
+                        let all_text = format!("{e:#} {e:?}").to_lowercase();
+                        if all_text.contains("goaway") || all_text.contains("go_away")
+                            || all_text.contains("connection closed")
+                            || all_text.contains("reset by peer")
+                        {
+                            goaway_detected = true;
+                            exit_reason = "goaway";
+                        } else {
+                            exit_reason = "error";
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let mut detail = format!(
+        "ran {:.1}m ({exit_reason}): pings_sent={pings_sent} pongs={pongs_received} server_pings={server_pings} slots={slot_count}",
+        elapsed.as_secs_f64() / 60.0
+    );
+    if goaway_detected {
+        detail.push_str(&format!(
+            "\n         GOAWAY at {:.1}m — connection died after {pings_sent} pings",
+            elapsed.as_secs_f64() / 60.0
+        ));
+    }
+
+    Ok(detail)
+}
+
+// --- Latency Comparison ---
+
+struct Target {
+    name: String,
+    url: String,
+    auth_header: String,
+    api_key: String,
+}
+
+struct LatencyEvent {
+    target: String,
+    slot: u64,
+    kind: &'static str,
+    time: Instant,
+    size: usize,
+}
+
+fn parse_target(s: &str) -> Result<Target> {
+    let parts: Vec<&str> = s.splitn(4, ',').collect();
+    if parts.len() != 4 {
+        bail!("invalid target format: expected name,url,header,key\n  got: {s}");
+    }
+    Ok(Target {
+        name: parts[0].to_string(),
+        url: parts[1].to_string(),
+        auth_header: parts[2].to_string(),
+        api_key: parts[3].to_string(),
+    })
+}
+
+fn format_delta(d: Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms < 1.0 {
+        format!("+{ms:.1}ms")
+    } else {
+        format!("+{ms:.0}ms")
+    }
+}
+
+fn percentile_duration(values: &mut [Duration], p: f64) -> Duration {
+    if values.is_empty() {
+        return Duration::ZERO;
+    }
+    values.sort();
+    let idx = ((values.len() as f64 * p / 100.0).ceil() as usize).saturating_sub(1);
+    values[idx.min(values.len() - 1)]
+}
+
+async fn run_latency_target(
+    target: Target,
+    event_tx: mpsc::Sender<LatencyEvent>,
+    duration: Duration,
+) -> Result<()> {
+    let endpoint = Endpoint::from_shared(target.url.clone())?
+        .tls_config(ClientTlsConfig::new().with_native_roots())?;
+    let channel = endpoint
+        .connect()
+        .await
+        .with_context(|| format!("{}: failed to connect", target.name))?;
+
+    let key: tonic::metadata::AsciiMetadataValue = target
+        .api_key
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{}: invalid API key", target.name))?;
+    let header: tonic::metadata::AsciiMetadataKey = target
+        .auth_header
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{}: invalid auth header", target.name))?;
+
+    let mut client = GeyserClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(header.clone(), key.clone());
+        Ok(req)
+    })
+    .max_decoding_message_size(MAX_DECODE_SIZE);
+
+    let (tx, rx) = mpsc::channel::<SubscribeRequest>(16);
+    let request = SubscribeRequest {
+        slots: HashMap::from([(
+            "lat_slots".to_string(),
+            SubscribeRequestFilterSlots {
+                filter_by_commitment: Some(true),
+                ..Default::default()
+            },
+        )]),
+        blocks: HashMap::from([(
+            "lat_blocks".to_string(),
+            SubscribeRequestFilterBlocks {
+                account_include: vec![],
+                include_transactions: Some(true),
+                include_accounts: Some(false),
+                include_entries: Some(false),
+            },
+        )]),
+        commitment: Some(CommitmentLevel::Confirmed as i32),
+        ..Default::default()
+    };
+    tx.send(request)
+        .await
+        .map_err(|_| anyhow::anyhow!("send failed"))?;
+
+    let mut stream = client
+        .subscribe(ReceiverStream::new(rx))
+        .await
+        .with_context(|| format!("{}: subscribe failed", target.name))?
+        .into_inner();
+
+    let mut ping_counter = 0i32;
+    let name = target.name;
+
+    let deadline = tokio::time::sleep(duration);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            msg = stream.next() => {
+                let Some(msg) = msg else { break };
+                let msg = msg?;
+                match msg.update_oneof {
+                    Some(UpdateOneof::Ping(_)) => {
+                        ping_counter += 1;
+                        let _ = tx.send(SubscribeRequest {
+                            ping: Some(SubscribeRequestPing { id: ping_counter }),
+                            ..Default::default()
+                        }).await;
+                    }
+                    Some(UpdateOneof::Slot(slot)) => {
+                        let _ = event_tx.send(LatencyEvent {
+                            target: name.clone(),
+                            slot: slot.slot,
+                            kind: "slot",
+                            time: Instant::now(),
+                            size: 0,
+                        }).await;
+                    }
+                    Some(UpdateOneof::Block(block)) => {
+                        let _ = event_tx.send(LatencyEvent {
+                            target: name.clone(),
+                            slot: block.slot,
+                            kind: "block",
+                            time: Instant::now(),
+                            size: block.encoded_len(),
+                        }).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn test_latency(targets: Vec<Target>, duration_secs: u64) -> Result<String> {
+    let duration = Duration::from_secs(duration_secs);
+    let num_targets = targets.len();
+    let target_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+
+    println!("         comparing {num_targets} endpoints for {duration_secs}s...");
+    for t in &targets {
+        println!("         - {}: {} ({})", t.name, t.url, t.auth_header);
+    }
+
+    let (event_tx, mut event_rx) = mpsc::channel::<LatencyEvent>(10_000);
+
+    let mut handles = Vec::new();
+    for target in targets {
+        let name = target.name.clone();
+        let tx = event_tx.clone();
+        handles.push((name, tokio::spawn(run_latency_target(target, tx, duration))));
+    }
+    drop(event_tx);
+
+    // Collect events
+    let mut slot_arrivals: HashMap<u64, Vec<(String, Instant)>> = HashMap::new();
+    let mut block_arrivals: HashMap<u64, Vec<(String, Instant, usize)>> = HashMap::new();
+
+    while let Some(event) = event_rx.recv().await {
+        match event.kind {
+            "slot" => slot_arrivals
+                .entry(event.slot)
+                .or_default()
+                .push((event.target, event.time)),
+            "block" => block_arrivals
+                .entry(event.slot)
+                .or_default()
+                .push((event.target, event.time, event.size)),
+            _ => {}
+        }
+    }
+
+    // Wait for tasks
+    for (name, handle) in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => println!("         {name}: error: {e:#}"),
+            Err(e) => println!("         {name}: task panicked: {e}"),
+        }
+    }
+
+    // Count raw totals per endpoint
+    let mut raw_slot_totals: HashMap<String, u64> = HashMap::new();
+    let mut raw_block_totals: HashMap<String, u64> = HashMap::new();
+    for name in &target_names {
+        raw_slot_totals.insert(name.clone(), 0);
+        raw_block_totals.insert(name.clone(), 0);
+    }
+    for arrivals in slot_arrivals.values() {
+        for (name, _) in arrivals {
+            *raw_slot_totals.get_mut(name).unwrap() += 1;
+        }
+    }
+    for arrivals in block_arrivals.values() {
+        for (name, _, _) in arrivals {
+            *raw_block_totals.get_mut(name).unwrap() += 1;
+        }
+    }
+
+    // Print raw totals
+    println!("\n         === Per-Endpoint Totals ===");
+    for name in &target_names {
+        println!(
+            "         {:<16} slots={:<6} blocks={}",
+            name, raw_slot_totals[name], raw_block_totals[name]
+        );
+    }
+
+    // Check if comparison is possible
+    let endpoints_with_slots = target_names
+        .iter()
+        .filter(|n| raw_slot_totals[*n] > 0)
+        .count();
+    if endpoints_with_slots < 2 {
+        bail!(
+            "cannot compare: only {endpoints_with_slots} endpoint(s) produced data (need at least 2)"
+        );
+    }
+
+    // Analyze slots
+    let mut slot_deltas: HashMap<String, Vec<Duration>> = HashMap::new();
+    let mut slot_wins: HashMap<String, u64> = HashMap::new();
+    let mut slot_compared: HashMap<String, u64> = HashMap::new();
+    for name in &target_names {
+        slot_deltas.insert(name.clone(), Vec::new());
+        slot_wins.insert(name.clone(), 0);
+        slot_compared.insert(name.clone(), 0);
+    }
+
+    let mut compared_slots = 0u64;
+    for (_, mut arrivals) in slot_arrivals {
+        if arrivals.len() < 2 {
+            continue;
+        }
+        compared_slots += 1;
+        arrivals.sort_by_key(|(_, t)| *t);
+        let first_time = arrivals[0].1;
+        *slot_wins.get_mut(&arrivals[0].0).unwrap() += 1;
+        for (name, time) in &arrivals {
+            slot_deltas
+                .get_mut(name)
+                .unwrap()
+                .push(time.duration_since(first_time));
+            *slot_compared.get_mut(name).unwrap() += 1;
+        }
+    }
+
+    // Analyze blocks
+    let mut block_deltas: HashMap<String, Vec<Duration>> = HashMap::new();
+    let mut block_wins: HashMap<String, u64> = HashMap::new();
+    let mut block_compared: HashMap<String, u64> = HashMap::new();
+    let mut block_sizes: HashMap<String, Vec<usize>> = HashMap::new();
+    for name in &target_names {
+        block_deltas.insert(name.clone(), Vec::new());
+        block_wins.insert(name.clone(), 0);
+        block_compared.insert(name.clone(), 0);
+        block_sizes.insert(name.clone(), Vec::new());
+    }
+
+    let mut compared_blocks = 0u64;
+    for (_, mut arrivals) in block_arrivals {
+        if arrivals.len() < 2 {
+            continue;
+        }
+        compared_blocks += 1;
+        arrivals.sort_by_key(|(_, t, _)| *t);
+        let first_time = arrivals[0].1;
+        *block_wins.get_mut(&arrivals[0].0).unwrap() += 1;
+        for (name, time, size) in &arrivals {
+            block_deltas
+                .get_mut(name)
+                .unwrap()
+                .push(time.duration_since(first_time));
+            *block_compared.get_mut(name).unwrap() += 1;
+            block_sizes.get_mut(name).unwrap().push(*size);
+        }
+    }
+
+    // Print slot comparison
+    println!(
+        "\n         === Slot Latency ({compared_slots} comparable) ==="
+    );
+    println!(
+        "         {:<16} {:>6} {:>8} {:>6} {:>10} {:>10} {:>10}",
+        "Endpoint", "Total", "Compared", "Wins", "Avg Δ", "P50 Δ", "P99 Δ"
+    );
+    let mut slot_winner = String::new();
+    let mut best_wins = 0u64;
+    for name in &target_names {
+        let wins = slot_wins[name];
+        let total = raw_slot_totals[name];
+        let compared = slot_compared[name];
+        let deltas = slot_deltas.get_mut(name).unwrap();
+        let avg = if deltas.is_empty() {
+            Duration::ZERO
+        } else {
+            deltas.iter().sum::<Duration>() / deltas.len() as u32
+        };
+        let p50 = percentile_duration(deltas, 50.0);
+        let p99 = percentile_duration(deltas, 99.0);
+        println!(
+            "         {:<16} {:>6} {:>8} {:>6} {:>10} {:>10} {:>10}",
+            name,
+            total,
+            compared,
+            wins,
+            format_delta(avg),
+            format_delta(p50),
+            format_delta(p99)
+        );
+        if wins > best_wins {
+            best_wins = wins;
+            slot_winner = name.clone();
+        }
+    }
+
+    // Print block comparison
+    if compared_blocks > 0 {
+        println!(
+            "\n         === Block Latency ({compared_blocks} comparable) ==="
+        );
+        println!(
+            "         {:<16} {:>6} {:>8} {:>6} {:>10} {:>10} {:>10} {:>10}",
+            "Endpoint", "Total", "Compared", "Wins", "Avg Δ", "P50 Δ", "P99 Δ", "Avg Size"
+        );
+        for name in &target_names {
+            let wins = block_wins[name];
+            let total = raw_block_totals[name];
+            let compared = block_compared[name];
+            let deltas = block_deltas.get_mut(name).unwrap();
+            let avg = if deltas.is_empty() {
+                Duration::ZERO
+            } else {
+                deltas.iter().sum::<Duration>() / deltas.len() as u32
+            };
+            let p50 = percentile_duration(deltas, 50.0);
+            let p99 = percentile_duration(deltas, 99.0);
+            let sizes = &block_sizes[name];
+            let avg_size = if sizes.is_empty() {
+                0.0
+            } else {
+                sizes.iter().sum::<usize>() as f64 / sizes.len() as f64 / (1024.0 * 1024.0)
+            };
+            println!(
+                "         {:<16} {:>6} {:>8} {:>6} {:>10} {:>10} {:>10} {:>8.1}MB",
+                name,
+                total,
+                compared,
+                wins,
+                format_delta(avg),
+                format_delta(p50),
+                format_delta(p99),
+                avg_size
+            );
+        }
+    }
+
+    Ok(format!(
+        "compared {num_targets} endpoints for {duration_secs}s: {compared_slots} slots, {compared_blocks} blocks, slot winner={slot_winner}"
+    ))
+}
+
 // --- Test Registry ---
 
 const UNARY_TESTS: &[(&str, &str)] = &[
@@ -1374,6 +1965,10 @@ fn print_test_list() {
     println!("\n  Long-running / stress:");
     println!("    soak          Soak test (use `soak` subcommand)");
     println!("    stress        Stream flood (use `stress` subcommand)");
+    println!("    goaway        Ping flood to detect GOAWAY (use `goaway` subcommand)");
+    println!("\n  Multi-endpoint:");
+    println!("    latency       Compare latency between endpoints (use `latency` subcommand)");
+    println!("                  args: name,url,header,key (one per target, at least 2)");
 }
 
 // --- Main ---
@@ -1389,6 +1984,31 @@ async fn main() {
     if matches!(cli.command, Some(Commands::List)) {
         print_test_list();
         return;
+    }
+
+    // Latency comparison uses per-target auth, not global config
+    if let Some(Commands::Latency { ref duration, ref targets }) = cli.command {
+        let parsed = match targets
+            .iter()
+            .map(|s| parse_target(s))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {e}");
+                process::exit(2);
+            }
+        };
+        if parsed.len() < 2 {
+            eprintln!("error: latency comparison requires at least 2 targets");
+            process::exit(2);
+        }
+        let dur = *duration;
+        println!("=== Yellowstone gRPC Latency Comparison ===\n");
+        let mut t = TestRunner::new();
+        t.run("Latency Comparison", test_latency(parsed, dur)).await;
+        t.summary();
+        process::exit(t.exit_code());
     }
 
     let api_key = cli.api_key.unwrap_or_else(|| {
@@ -1459,7 +2079,11 @@ async fn main() {
             )
             .await;
         }
-        Some(Commands::List) => unreachable!(),
+        Some(Commands::Goaway { duration }) => {
+            println!("--- GOAWAY Detection Test ---");
+            t.run("GOAWAY (ping flood)", test_goaway(duration)).await;
+        }
+        Some(Commands::List | Commands::Latency { .. }) => unreachable!(),
     }
 
     t.summary();
