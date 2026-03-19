@@ -116,6 +116,12 @@ enum Commands {
     },
     /// List all available tests
     List,
+    /// Billing analysis: run all RPC types and count messages for cost estimation
+    Billing {
+        /// Stream messages to collect per subscription
+        #[arg(short, long, default_value = "5")]
+        messages: u32,
+    },
 }
 
 // --- Config (global, populated from CLI) ---
@@ -1296,6 +1302,7 @@ async fn test_goaway(duration_secs: u64) -> Result<String> {
     let mut server_pings = 0u64;
     let mut slot_count = 0u64;
     let mut goaway_detected = false;
+    let mut goaway_time = 0.0;
     let mut exit_reason = "duration elapsed";
     let start = Instant::now();
 
@@ -1328,23 +1335,24 @@ async fn test_goaway(duration_secs: u64) -> Result<String> {
                 }
 
                 // Probe for GOAWAY by attempting to open a new stream via Unary Ping
-                let mut p_client = ping_client.clone();
-                let p_tx = unary_err_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = p_client.ping(yellowstone_grpc_proto::geyser::PingRequest { count: 1 }).await {
-                        let _ = p_tx.send(e).await;
-                    }
-                });
+                if !goaway_detected {
+                    let mut p_client = ping_client.clone();
+                    let p_tx = unary_err_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = p_client.ping(yellowstone_grpc_proto::geyser::PingRequest { count: 1 }).await {
+                            let _ = p_tx.send(e).await;
+                        }
+                    });
+                }
             }
             Some(err) = unary_err_rx.recv() => {
                 let all_text = format!("{err:#} {err:?}").to_lowercase();
                 if all_text.contains("goaway") || all_text.contains("go_away") || all_text.contains("connection closed") || all_text.contains("transport error") {
-                    let mins = start.elapsed().as_secs_f64() / 60.0;
-                    println!("         [{mins:.0}m] UNARY PING ERROR (GOAWAY Probe):");
-                    println!("           message: {}", err.message());
-                    goaway_detected = true;
-                    exit_reason = "goaway (detected by unary ping)";
-                    break;
+                    if !goaway_detected {
+                        let mins = start.elapsed().as_secs_f64() / 60.0;
+                        goaway_detected = true;
+                        goaway_time = mins;
+                    }
                 } else {
                     // Likely an upstream error 
                     // Log it periodically but don't break the test
@@ -1443,7 +1451,8 @@ async fn test_goaway(duration_secs: u64) -> Result<String> {
     );
     if goaway_detected {
         detail.push_str(&format!(
-            "\n         GOAWAY at {:.1}m — connection died after {pings_sent} pings",
+            "\n         ✅ GOAWAY received at {:.1}m, and the main stream successfully survived until {:.1}m!",
+            goaway_time,
             elapsed.as_secs_f64() / 60.0
         ));
     }
@@ -1831,6 +1840,359 @@ async fn test_latency(targets: Vec<Target>, duration_secs: u64) -> Result<String
     ))
 }
 
+// --- Billing Analysis ---
+
+/// Run all RPC types, count every request and response, and print a billing table.
+///
+/// Billing formula:
+///   Unary RPC:  1 billing event per request message + 1 per response message
+///   Streaming:  subscribe() call is FREE
+///               initial SubscribeRequest (filter message) = 1 billing event
+///               first response = FREE; each additional response = 1 billing event
+///   Keepalive:  client pong-reply messages tracked separately
+async fn run_billing_analysis(stream_messages: u32) -> Result<String> {
+    struct Row {
+        label: &'static str,
+        kind: &'static str, // "unary" | "stream"
+        reqs: u64,
+        resps: u64,
+        free: u64, // 1 for stream (first response free), 0 for unary
+    }
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut ping_replies: u64 = 0;
+    let mut server_pings_rcvd: u64 = 0;
+    let mut pongs_rcvd: u64 = 0;
+
+    // --- Unary RPCs ---
+    println!("  Running unary RPCs...");
+    {
+        let mut client = connect!();
+
+        client
+            .get_version(yellowstone_grpc_proto::geyser::GetVersionRequest {})
+            .await
+            .context("GetVersion")?;
+        rows.push(Row { label: "GetVersion", kind: "unary", reqs: 1, resps: 1, free: 0 });
+
+        client
+            .ping(yellowstone_grpc_proto::geyser::PingRequest { count: 1 })
+            .await
+            .context("Ping")?;
+        rows.push(Row { label: "Ping (unary)", kind: "unary", reqs: 1, resps: 1, free: 0 });
+
+        for (_, level) in commitment_levels() {
+            client
+                .get_latest_blockhash(
+                    yellowstone_grpc_proto::geyser::GetLatestBlockhashRequest {
+                        commitment: Some(level as i32),
+                    },
+                )
+                .await
+                .context("GetLatestBlockhash")?;
+        }
+        rows.push(Row {
+            label: "GetLatestBlockhash (x3 commitments)",
+            kind: "unary",
+            reqs: 3,
+            resps: 3,
+            free: 0,
+        });
+
+        for (_, level) in commitment_levels() {
+            client
+                .get_block_height(yellowstone_grpc_proto::geyser::GetBlockHeightRequest {
+                    commitment: Some(level as i32),
+                })
+                .await
+                .context("GetBlockHeight")?;
+        }
+        rows.push(Row {
+            label: "GetBlockHeight (x3 commitments)",
+            kind: "unary",
+            reqs: 3,
+            resps: 3,
+            free: 0,
+        });
+
+        for (_, level) in commitment_levels() {
+            client
+                .get_slot(yellowstone_grpc_proto::geyser::GetSlotRequest {
+                    commitment: Some(level as i32),
+                })
+                .await
+                .context("GetSlot")?;
+        }
+        rows.push(Row {
+            label: "GetSlot (x3 commitments)",
+            kind: "unary",
+            reqs: 3,
+            resps: 3,
+            free: 0,
+        });
+
+        let bh = client
+            .get_latest_blockhash(
+                yellowstone_grpc_proto::geyser::GetLatestBlockhashRequest {
+                    commitment: Some(CommitmentLevel::Finalized as i32),
+                },
+            )
+            .await
+            .context("GetLatestBlockhash for IsBlockhashValid")?
+            .into_inner();
+        client
+            .is_blockhash_valid(yellowstone_grpc_proto::geyser::IsBlockhashValidRequest {
+                blockhash: bh.blockhash,
+                commitment: Some(CommitmentLevel::Finalized as i32),
+            })
+            .await
+            .context("IsBlockhashValid")?;
+        rows.push(Row {
+            label: "GetLatestBlockhash + IsBlockhashValid",
+            kind: "unary",
+            reqs: 2,
+            resps: 2,
+            free: 0,
+        });
+
+        client
+            .subscribe_replay_info(SubscribeReplayInfoRequest {})
+            .await
+            .context("SubscribeReplayInfo")?;
+        rows.push(Row {
+            label: "SubscribeReplayInfo",
+            kind: "unary",
+            reqs: 1,
+            resps: 1,
+            free: 0,
+        });
+    }
+    println!("  Unary RPCs: done");
+
+    // --- Subscribe: Slots ---
+    println!("  Subscribe(slots): collecting {stream_messages} messages...");
+    {
+        let request = SubscribeRequest {
+            slots: HashMap::from([(
+                "bill_slots".to_string(),
+                SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            ..Default::default()
+        };
+        let mut sub = GeyserStream::connect(request).await?;
+        let mut count = 0u32;
+        tokio::time::timeout(stream_timeout(), async {
+            while let Some(upd) = sub.next_data().await? {
+                if let UpdateOneof::Slot(_) = upd {
+                    count += 1;
+                }
+                if count >= stream_messages {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("Subscribe(slots) timed out")??;
+        ping_replies += sub.pings_handled as u64;
+        server_pings_rcvd += sub.pings_handled as u64;
+        pongs_rcvd += sub.pongs_received as u64;
+        rows.push(Row {
+            label: "Subscribe(slots)",
+            kind: "stream",
+            reqs: 1,
+            resps: count as u64,
+            free: 1,
+        });
+        println!("  Subscribe(slots): received {count}");
+    }
+
+    // --- Subscribe: Transactions ---
+    println!("  Subscribe(transactions): collecting {stream_messages} messages...");
+    {
+        let request = SubscribeRequest {
+            transactions: HashMap::from([(
+                "bill_txs".to_string(),
+                SubscribeRequestFilterTransactions {
+                    vote: Some(false),
+                    failed: Some(false),
+                    account_include: vec![SYSTEM_PROGRAM.to_string()],
+                    ..Default::default()
+                },
+            )]),
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            ..Default::default()
+        };
+        let mut sub = GeyserStream::connect(request).await?;
+        let mut count = 0u32;
+        tokio::time::timeout(stream_timeout(), async {
+            while let Some(upd) = sub.next_data().await? {
+                if let UpdateOneof::Transaction(_) = upd {
+                    count += 1;
+                }
+                if count >= stream_messages {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("Subscribe(transactions) timed out")??;
+        ping_replies += sub.pings_handled as u64;
+        server_pings_rcvd += sub.pings_handled as u64;
+        pongs_rcvd += sub.pongs_received as u64;
+        rows.push(Row {
+            label: "Subscribe(transactions)",
+            kind: "stream",
+            reqs: 1,
+            resps: count as u64,
+            free: 1,
+        });
+        println!("  Subscribe(transactions): received {count}");
+    }
+
+    // --- Subscribe: BlocksMeta ---
+    println!("  Subscribe(blocks_meta): collecting {stream_messages} messages...");
+    {
+        let request = SubscribeRequest {
+            blocks_meta: HashMap::from([(
+                "bill_bmeta".to_string(),
+                SubscribeRequestFilterBlocksMeta {},
+            )]),
+            commitment: Some(CommitmentLevel::Confirmed as i32),
+            ..Default::default()
+        };
+        let mut sub = GeyserStream::connect(request).await?;
+        let mut count = 0u32;
+        tokio::time::timeout(stream_timeout(), async {
+            while let Some(upd) = sub.next_data().await? {
+                if let UpdateOneof::BlockMeta(_) = upd {
+                    count += 1;
+                }
+                if count >= stream_messages {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("Subscribe(blocks_meta) timed out")??;
+        ping_replies += sub.pings_handled as u64;
+        server_pings_rcvd += sub.pings_handled as u64;
+        pongs_rcvd += sub.pongs_received as u64;
+        rows.push(Row {
+            label: "Subscribe(blocks_meta)",
+            kind: "stream",
+            reqs: 1,
+            resps: count as u64,
+            free: 1,
+        });
+        println!("  Subscribe(blocks_meta): received {count}");
+    }
+
+    // --- Print billing tables ---
+    println!();
+    println!("  Billing formula:");
+    println!("    Unary RPC:  1 billing event per request + 1 per response");
+    println!("    Streaming:  subscribe() call is FREE");
+    println!("                initial SubscribeRequest (filter msg) = 1 billing event");
+    println!("                1st response = FREE; each additional response = 1 billing event");
+    println!("    Keepalive:  client pong-reply messages listed separately");
+    println!();
+
+    let sep = format!(
+        "  {}  {}  {}  {}",
+        "-".repeat(43),
+        "-".repeat(7),
+        "-".repeat(12),
+        "-".repeat(24)
+    );
+
+    // ── REQUESTS SENT ──────────────────────────────────────────────────────
+    println!("  {:<43}  {:>7}  {:>12}  {}", "REQUESTS SENT", "Count", "Bill.Events", "Note");
+    println!("{sep}");
+    let mut req_data_count = 0u64;
+    let mut req_data_bill = 0u64;
+    for r in &rows {
+        req_data_count += r.reqs;
+        req_data_bill += r.reqs;
+        let note = if r.kind == "stream" { "initial SubscribeRequest" } else { "RPC call" };
+        println!("  {:<43}  {:>7}  {:>12}  {}", r.label, r.reqs, r.reqs, note);
+    }
+    println!(
+        "  {:<43}  {:>7}  {:>12}  {}",
+        "PingReply (keepalive)", ping_replies, ping_replies, "pong-reply to server ping"
+    );
+    println!("{sep}");
+    println!(
+        "  {:<43}  {:>7}  {:>12}  {}",
+        "Subtotal (data only)", req_data_count, req_data_bill, "excl. keepalive"
+    );
+    println!(
+        "  {:<43}  {:>7}  {:>12}  {}",
+        "TOTAL REQUESTS",
+        req_data_count + ping_replies,
+        req_data_bill + ping_replies,
+        "incl. keepalive"
+    );
+    println!();
+
+    // ── RESPONSES RECEIVED ─────────────────────────────────────────────────
+    println!("  {:<43}  {:>7}  {:>12}  {}", "RESPONSES RECEIVED", "Count", "Bill.Events", "Note");
+    println!("{sep}");
+    let mut resp_data_count = 0u64;
+    let mut resp_data_bill = 0u64;
+    for r in &rows {
+        let bill = r.resps.saturating_sub(r.free);
+        resp_data_count += r.resps;
+        resp_data_bill += bill;
+        let note = if r.free > 0 { "1st response free" } else { "" };
+        println!("  {:<43}  {:>7}  {:>12}  {}", r.label, r.resps, bill, note);
+    }
+    println!(
+        "  {:<43}  {:>7}  {:>12}  {}",
+        "ServerPing (server keepalive)", server_pings_rcvd, 0u64, "infra, not billed"
+    );
+    println!(
+        "  {:<43}  {:>7}  {:>12}  {}",
+        "Pong (reply to our PingReply)", pongs_rcvd, 0u64, "infra, not billed"
+    );
+    let resp_infra = server_pings_rcvd + pongs_rcvd;
+    println!("{sep}");
+    println!(
+        "  {:<43}  {:>7}  {:>12}  {}",
+        "Subtotal (data only)", resp_data_count, resp_data_bill, "excl. infra"
+    );
+    println!(
+        "  {:<43}  {:>7}  {:>12}  {}",
+        "TOTAL RESPONSES",
+        resp_data_count + resp_infra,
+        resp_data_bill,
+        "incl. infra"
+    );
+    println!();
+
+    // ── GRAND TOTAL ────────────────────────────────────────────────────────
+    let grand_data = req_data_bill + resp_data_bill;
+    let grand_all = req_data_bill + ping_replies + resp_data_bill;
+    let rule = "=".repeat(92);
+    println!("  {rule}");
+    println!("  GRAND TOTAL BILLING EVENTS");
+    println!("  {:<43}  {:>7}", "Excl. keepalive ping replies:", grand_data);
+    println!("  {:<43}  {:>7}", "Incl. keepalive ping replies:", grand_all);
+    println!("  {rule}");
+
+    Ok(format!(
+        "total_req={} total_resp={} billing_excl_pings={grand_data} billing_incl_pings={grand_all}",
+        req_data_count + ping_replies,
+        resp_data_count + resp_infra,
+    ))
+}
+
 // --- Test Registry ---
 
 const UNARY_TESTS: &[(&str, &str)] = &[
@@ -1969,6 +2331,9 @@ fn print_test_list() {
     println!("\n  Multi-endpoint:");
     println!("    latency       Compare latency between endpoints (use `latency` subcommand)");
     println!("                  args: name,url,header,key (one per target, at least 2)");
+    println!("\n  Billing:");
+    println!("    billing       Count all requests/responses and compute billing events");
+    println!("                  use `billing --messages N` to set stream message count (default 5)");
 }
 
 // --- Main ---
@@ -2082,6 +2447,10 @@ async fn main() {
         Some(Commands::Goaway { duration }) => {
             println!("--- GOAWAY Detection Test ---");
             t.run("GOAWAY (ping flood)", test_goaway(duration)).await;
+        }
+        Some(Commands::Billing { messages }) => {
+            println!("--- Billing Analysis ---");
+            t.run("Billing Analysis", run_billing_analysis(messages)).await;
         }
         Some(Commands::List | Commands::Latency { .. }) => unreachable!(),
     }
