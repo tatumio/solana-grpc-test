@@ -56,6 +56,12 @@ solana-grpc-test latency -d 120 \
 
 # List all available tests
 solana-grpc-test list
+
+# Billing analysis: count all requests/responses and compute billing events
+solana-grpc-test -k <api-key> billing
+
+# Billing with custom stream message count (default: 5)
+solana-grpc-test -k <api-key> billing --messages 10
 ```
 
 With `cargo run`:
@@ -88,7 +94,7 @@ API_KEY=<key> GRPC_ENDPOINT=https://your-endpoint.com cargo run
 
 | Command | Description |
 |---|---|
-| _(none)_ / `all` | Run all 18 tests |
+| _(none)_ / `all` | Run all tests |
 | `unary` | Run unary RPC tests only |
 | `stream` | Run streaming subscription tests only |
 | `advanced` | Run advanced stream tests only |
@@ -97,6 +103,7 @@ API_KEY=<key> GRPC_ENDPOINT=https://your-endpoint.com cargo run
 | `stress [connections] [streams-per-conn]` | Open many concurrent streams to find the server limit (default: 10×10) |
 | `goaway [seconds]` | Ping flood on single connection to detect GOAWAY (default: 7200s = 2 hours) |
 | `latency [-d secs] <target>...` | Compare slot/block delivery latency between endpoints. Target format: `name,url,header,key` |
+| `billing [-m N]` | Count all requests and responses across every RPC type and compute billing events (default: 5 stream messages per subscription) |
 | `list` | List all available test names |
 
 ## Tests
