@@ -1,14 +1,32 @@
 # solana-grpc-test
 
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Yellowstone gRPC](https://img.shields.io/badge/Yellowstone-gRPC-9945FF?logo=solana&logoColor=white)](https://docs.tatum.io/reference/rpc-solana)
+[![Built by Tatum](https://img.shields.io/badge/Built%20by-Tatum-6E56CF)](https://tatum.io/chain/solana)
+
 Test suite for validating Solana Yellowstone gRPC (Geyser) endpoints. Tests all RPCs, streaming subscriptions, and edge cases, then reports pass/fail.
+
+![demo](demo.gif)
+
+## Why This Exists
+
+Yellowstone endpoints vary significantly in practice — some drop connections silently, stop responding to pings, reject resubscriptions, or fall over under concurrent streams. This tool was built to validate [Tatum's Solana gRPC infrastructure](https://tatum.io/chain/solana) against those failure modes, and is open-sourced for anyone testing any Yellowstone-compatible endpoint. See the [Solana RPC reference](https://docs.tatum.io/reference/rpc-solana) for the full method list.
+
+## Quick Start
+
+```bash
+cargo install --path .
+solana-grpc-test -k <api-key>
+```
+
+> No API key yet? Get one free at [tatum.io/chain/solana](https://tatum.io/chain/solana).
 
 ## Install
 
 ```bash
 cargo install --path .
 ```
-
-This builds the binary and puts it in `~/.cargo/bin/solana-grpc-test`. Make sure `~/.cargo/bin` is in your `PATH` (it is by default with rustup).
 
 If you just want to run from source without installing, use `cargo run --` instead of `solana-grpc-test` in any command below.
 
@@ -132,3 +150,7 @@ Each test maps 1:1 to a function in `src/main.rs`.
 | 18 | `streams` | Opens C connections × S streams each (all subscribing to slots) to find both the connection limit and per-connection stream limit. Verifies all streams receive data. Use `stress <connections> <streams-per-conn>` subcommand or `--stress-connections` / `--stress-streams` flags |
 | 19 | `soak` | Long-running stability test. Subscribes to slots + transactions + blocks_meta simultaneously for the configured duration. Prints per-minute stats: message counts, slot gaps, ping/pong health, errors |
 | 20 | `goaway` | Sends 1 gRPC ping/sec on a single connection for 2+ hours. Monitors for HTTP/2 GOAWAY frames, stream resets, or connection drops. Reports when/if the connection dies and whether GOAWAY was the cause |
+
+## License
+
+[Apache 2.0](LICENSE)

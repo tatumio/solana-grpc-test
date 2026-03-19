@@ -350,23 +350,23 @@ impl TestRunner {
         match fut.await {
             Ok(detail) => {
                 let elapsed = start.elapsed();
-                println!("[PASS] ({elapsed:.0?})\n         {detail}");
+                println!("\x1b[32m[PASS]\x1b[0m ({elapsed:.0?})\n         {detail}");
                 self.passed += 1;
             }
             Err(e) => {
                 let elapsed = start.elapsed();
-                println!("[FAIL] ({elapsed:.0?})\n         Error: {e:#}");
+                println!("\x1b[31m[FAIL]\x1b[0m ({elapsed:.0?})\n         Error: {e:#}");
             }
         }
     }
 
     fn summary(&self) {
         println!();
-        println!("=== Results: {}/{} passed ===", self.passed, self.total);
+        println!("\x1b[1m=== Results: {}/{} passed ===\x1b[0m", self.passed, self.total);
         if self.passed == self.total {
-            println!("All tests passed!");
+            println!("\x1b[32mAll tests passed!\x1b[0m");
         } else {
-            println!("{} test(s) failed.", self.total - self.passed);
+            println!("\x1b[31m{} test(s) failed.\x1b[0m", self.total - self.passed);
         }
     }
 
@@ -957,7 +957,7 @@ async fn test_subscribe_deshred() -> Result<String> {
 }
 
 /// Back pressure: subscribe to a high-volume stream but read slowly.
-/// Verifies the proxy handles slow consumers gracefully.
+/// Verifies that endpoint handles slow consumers gracefully.
 async fn test_back_pressure() -> Result<String> {
     let request = SubscribeRequest {
         transactions: HashMap::from([(
@@ -2291,7 +2291,7 @@ async fn run_test_by_name(t: &mut TestRunner, name: &str) -> bool {
 }
 
 async fn run_group(t: &mut TestRunner, tests: &[(&str, &str)], label: &str) {
-    println!("--- {label} ---");
+    println!("\x1b[1;36m--- {label} ---\x1b[0m");
     for &(name, _) in tests {
         run_test_by_name(t, name).await;
     }
@@ -2395,7 +2395,7 @@ async fn main() {
         .expect("config already set");
 
     let cfg = config();
-    println!("=== Yellowstone gRPC Proxy Test ===");
+    println!("=== Yellowstone gRPC Endpoint Test ===");
     println!("Endpoint: {}", cfg.endpoint);
     println!("Auth header: {}", cfg.auth_header);
     println!(
